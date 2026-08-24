@@ -269,6 +269,10 @@ export function startApp(): void {
     root.dataset.solverXSamples = String(result.x.length);
     root.dataset.solverTSamples = String(result.t.length);
     root.dataset.geometryReady = "false";
+    if (hadRenderedTrace) {
+      surfaceRenderer.setCharacteristics(null, { deferRender: true });
+      snapshotRenderer.setCharacteristics(null);
+    }
     acceptedAxisNotation = axisNotation;
     const deferredPresentation = { defer: true } as const;
     surfaceRenderer.setSurfaceTopology(surfaceTopology, deferredPresentation);
@@ -280,10 +284,6 @@ export function startApp(): void {
     const validatedSolution = { validated: true } as const;
     surfaceRenderer.setSolution(result, validatedSolution);
     snapshotRenderer.setSolution(result, validatedSolution);
-    if (hadRenderedTrace) {
-      surfaceRenderer.setCharacteristics(null);
-      snapshotRenderer.setCharacteristics(null);
-    }
     renderProblemFormula(problem);
     createTimeTicks(timeTicks, problem.T);
     timeSlider.setAttribute("aria-valuemin", "0");

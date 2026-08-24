@@ -71,6 +71,7 @@ try {
   page = await context.newPage();
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitForAcceptedSolution(page);
+  await waitForStableRendererLayout(page);
 
   const slider = page.locator("#time-slider");
   const sliderMaximum = Number(await slider.getAttribute("max"));
@@ -570,6 +571,35 @@ async function waitForAcceptedSolution(page) {
     undefined,
     { timeout: 15_000 }
   );
+}
+
+async function waitForStableRendererLayout(page) {
+  await page.evaluate(async () => {
+    await document.fonts?.ready;
+    const signature = () => {
+      const surface = document.querySelector("#surface-section")?.getBoundingClientRect();
+      const snapshot = document.querySelector("#snapshot-section")?.getBoundingClientRect();
+      const canvas = document.querySelector(".wave-surface-canvas");
+      return [
+        surface?.width ?? 0,
+        surface?.height ?? 0,
+        snapshot?.width ?? 0,
+        snapshot?.height ?? 0,
+        canvas?.getAttribute("width") ?? "missing",
+        canvas?.getAttribute("height") ?? "missing"
+      ].join(":");
+    };
+    let previous = "";
+    let stableFrames = 0;
+    for (let frame = 0; frame < 12; frame += 1) {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      const current = signature();
+      stableFrames = current === previous ? stableFrames + 1 : 0;
+      previous = current;
+      if (stableFrames >= 2) return;
+    }
+    throw new Error(`Renderer layout did not settle: ${previous}.`);
+  });
 }
 
 async function takeLongTasks(page, finishedAt) {

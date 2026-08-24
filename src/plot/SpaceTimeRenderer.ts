@@ -72,6 +72,8 @@ const SURFACE_MATERIAL_DATASET = "lambert-lit";
 const SURFACE_LIGHTING_DATASET = "hemisphere-key-underfill";
 const SURFACE_UNDERSIDE_FILL_DATASET = "true";
 const SURFACE_PASS_DATASET = "single";
+const WEBGL_ANTIALIAS = false;
+const WEBGL_RESOLUTION_SCALE = 0.9;
 const SLICE_COLOR = 0xffe088;
 // The backward-left stored path preserves eta = x - t before any reflection;
 // the backward-right path preserves xi = x + t. Keep each broken reflected ray
@@ -284,6 +286,9 @@ export class SpaceTimeRenderer {
       side: THREE.DoubleSide,
       depthWrite: false
     });
+    // A zero-thickness plane needs both orientations but not Three's default
+    // two-pass transparent DoubleSide submission.
+    timePlaneMaterial.forceSinglePass = true;
     this.timePlane = new THREE.Mesh(new THREE.PlaneGeometry(8.2, 6.1), timePlaneMaterial);
     this.timePlane.name = "draggable-time-plane";
     this.timePlane.rotation.y = Math.PI / 2;
@@ -400,7 +405,12 @@ export class SpaceTimeRenderer {
       this.controls.maxPolarAngle = ORBIT_MAX_POLAR_ANGLE;
       this.controls.addEventListener("change", this.render);
       this.controls.update();
-      this.renderer!.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      this.renderer!.setPixelRatio(
+        Math.max(
+          0.75,
+          Math.min(window.devicePixelRatio || 1, 2) * WEBGL_RESOLUTION_SCALE
+        )
+      );
       this.renderer!.setSize(this.width, this.height, false);
       this.labelRenderer?.setSize(this.width, this.height);
       this.renderer!.setClearColor(0x000000, 1);
@@ -467,6 +477,7 @@ export class SpaceTimeRenderer {
     this.surfaceRangeMinimum = surfaceRange.min;
     this.surfaceRangeMaximum = surfaceRange.max;
     this.time = clampGridTime(solution, this.time);
+    this.positionTimePlane();
     this.rebuildSurface();
     this.rebuildPhysicalBoundaryTraces();
     this.rebuildFloorGrid();
@@ -507,18 +518,15 @@ export class SpaceTimeRenderer {
     if (this.destroyed) {
       return;
     }
-    this.time = this.solution
+    const nextTime = this.solution
       ? clampGridTime(this.solution, time)
       : Math.max(0, Number.isFinite(time) ? time : 0);
-    const x = this.solution ? this.worldT(this.time) : WORLD_T_MIN;
-    this.timePlane.position.x = x;
-    this.timePlaneOutline.position.x = x;
-    this.paintTimeSlice();
-    this.container.dataset.currentTime = String(this.time);
-    if (this.canvas) {
-      this.canvas.dataset.currentTime = String(this.time);
-      this.canvas.setAttribute("aria-valuetext", `time ${this.time.toFixed(3)}`);
+    if (nextTime === this.time) {
+      return;
     }
+    this.time = nextTime;
+    this.positionTimePlane();
+    this.paintTimeSlice();
     // Axis and annotation labels are static while only the retained time plane
     // and intersection move. Avoid a full CSS2D/KaTeX layout on every scrub.
     this.renderWebGL();
@@ -655,7 +663,6 @@ export class SpaceTimeRenderer {
     this.solution = null;
     this.physicalBoundaryPositions = [];
     this.characteristics = null;
-    this.time = 0;
     this.surfaceRangeMinimum = -1;
     this.surfaceRangeMaximum = 1;
     this.disposeSurface();
@@ -738,7 +745,7 @@ export class SpaceTimeRenderer {
         return null;
       }
       return new THREE.WebGLRenderer({
-        antialias: true,
+        antialias: WEBGL_ANTIALIAS,
         alpha: false,
         powerPreference: "high-performance"
       });
@@ -1205,6 +1212,17 @@ export class SpaceTimeRenderer {
     }
   }
 
+  private positionTimePlane(): void {
+    const x = this.solution ? this.worldT(this.time) : WORLD_T_MIN;
+    this.timePlane.position.x = x;
+    this.timePlaneOutline.position.x = x;
+    this.container.dataset.currentTime = String(this.time);
+    if (this.canvas) {
+      this.canvas.dataset.currentTime = String(this.time);
+      this.canvas.setAttribute("aria-valuetext", `time ${this.time.toFixed(3)}`);
+    }
+  }
+
   private paintCharacteristics(): void {
     this.clearGroup(this.characteristicFloorGroup);
     this.clearGroup(this.characteristicPointGroup);
@@ -1382,6 +1400,8 @@ export class SpaceTimeRenderer {
       target.dataset.surfaceLighting = SURFACE_LIGHTING_DATASET;
       target.dataset.surfaceUndersideFill = SURFACE_UNDERSIDE_FILL_DATASET;
       target.dataset.surfacePass = SURFACE_PASS_DATASET;
+      target.dataset.webglAntialias = String(WEBGL_ANTIALIAS);
+      target.dataset.webglResolutionScale = String(WEBGL_RESOLUTION_SCALE);
       target.dataset.surfaceTopology = this.surfaceTopology;
       target.dataset.surfaceWallMaterial =
         this.surfaceTopology === "stepped" ? "basic-unlit" : "none";

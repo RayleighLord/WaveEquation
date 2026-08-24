@@ -301,9 +301,13 @@ export class SnapshotRenderer {
     if (this.destroyed) {
       return;
     }
-    this.time = this.solution
+    const nextTime = this.solution
       ? clampGridTime(this.solution, time)
       : Math.max(0, Number.isFinite(time) ? time : 0);
+    if (nextTime === this.time) {
+      return;
+    }
+    this.time = nextTime;
     this.paint(false);
   }
 
@@ -311,17 +315,22 @@ export class SnapshotRenderer {
     if (this.destroyed) {
       return;
     }
+    let nextSelectedX: number | null;
     if (x === null || !Number.isFinite(x)) {
-      this.selectedX = null;
+      nextSelectedX = null;
     } else if (this.solution) {
-      this.selectedX = clamp(
+      nextSelectedX = clamp(
         x,
         Number(this.solution.x[0]),
         Number(this.solution.x[this.solution.x.length - 1])
       );
     } else {
-      this.selectedX = x;
+      nextSelectedX = x;
     }
+    if (nextSelectedX === this.selectedX) {
+      return;
+    }
+    this.selectedX = nextSelectedX;
     this.paintSelection();
     this.updateDescription();
   }

@@ -141,6 +141,8 @@ async function assertHealthyInitialRender(page) {
   assert.equal(await page.locator("#surface-plot").getAttribute("data-surface-lighting"), "hemisphere-key-underfill");
   assert.equal(await page.locator("#surface-plot").getAttribute("data-surface-underside-fill"), "true");
   assert.equal(await page.locator("#surface-plot").getAttribute("data-surface-pass"), "single");
+  assert.equal(await page.locator("#surface-plot").getAttribute("data-webgl-antialias"), "false");
+  assert.equal(await page.locator("#surface-plot").getAttribute("data-webgl-resolution-scale"), "0.9");
   assert.equal(await page.locator("#surface-plot").getAttribute("data-surface-grid-visible"), null);
   if ((await page.locator(".wave-surface-canvas").count()) > 0) {
     const canvas = page.locator(".wave-surface-canvas");
@@ -152,6 +154,26 @@ async function assertHealthyInitialRender(page) {
     assert.equal(await canvas.getAttribute("data-surface-lighting"), "hemisphere-key-underfill");
     assert.equal(await canvas.getAttribute("data-surface-underside-fill"), "true");
     assert.equal(await canvas.getAttribute("data-surface-pass"), "single");
+    assert.equal(await canvas.getAttribute("data-webgl-antialias"), "false");
+    assert.equal(await canvas.getAttribute("data-webgl-resolution-scale"), "0.9");
+    assert.equal(
+      await canvas.evaluate((element) => {
+        const context = element.getContext("webgl2") ?? element.getContext("webgl");
+        return context?.getContextAttributes()?.antialias ?? null;
+      }),
+      false,
+      "The CI-safe renderer must not allocate a multisampled WebGL framebuffer."
+    );
+    assert.ok(
+      Math.abs(
+        await canvas.evaluate((element) =>
+          element.width /
+          element.getBoundingClientRect().width /
+          Math.min(window.devicePixelRatio || 1, 2)
+        ) - 0.9
+      ) < 0.02,
+      "The WebGL drawing buffer must retain its measured 0.9 resolution scale."
+    );
     assert.equal(await canvas.getAttribute("data-surface-grid-visible"), null);
     assert.equal(await canvas.getAttribute("data-x-samples"), "513");
     assert.equal(await canvas.getAttribute("data-t-samples"), "161");
@@ -707,6 +729,8 @@ async function assertSurfaceRenderingContract(page, viewDescription) {
     "data-surface-lighting": "hemisphere-key-underfill",
     "data-surface-underside-fill": "true",
     "data-surface-pass": "single",
+    "data-webgl-antialias": "false",
+    "data-webgl-resolution-scale": "0.9",
     "data-surface-topology": "smooth",
     "data-surface-wall-material": "none"
   };

@@ -20,9 +20,14 @@ describe("SnapshotRenderer", () => {
     expect(renderer.svg.dataset.geometryReady).toBe("true");
     expect(renderer.svg.dataset.currentTime).toBe("0.5");
     expect(renderer.svg.dataset.sampleCount).toBe("3");
-    expect(renderer.svg.querySelector(".snapshot-curve")?.getAttribute("d")).toMatch(
+    const curve = renderer.svg.querySelector<SVGPathElement>(".snapshot-curve");
+    expect(curve?.getAttribute("d")).toMatch(
       /^M.+ L.+ L.+$/
     );
+    const setCurveAttribute = vi.spyOn(curve!, "setAttribute");
+    renderer.setTime(0.5);
+    expect(setCurveAttribute).not.toHaveBeenCalled();
+    setCurveAttribute.mockRestore();
     expect(renderer.svg.querySelectorAll(".snapshot-axis")).toHaveLength(2);
     expect(renderer.svg.querySelectorAll(".snapshot-x-tick")).toHaveLength(11);
     expect(renderer.svg.querySelectorAll(".snapshot-u-tick")).toHaveLength(5);
@@ -427,6 +432,8 @@ describe("SpaceTimeRenderer", () => {
     expect(host.dataset.surfaceLighting).toBe("hemisphere-key-underfill");
     expect(host.dataset.surfaceUndersideFill).toBe("true");
     expect(host.dataset.surfacePass).toBe("single");
+    expect(host.dataset.webglAntialias).toBe("false");
+    expect(host.dataset.webglResolutionScale).toBe("0.9");
     expect(host.dataset.surfaceTopology).toBe("smooth");
     expect(host.dataset.surfaceWallMaterial).toBe("none");
     expect(host.dataset.surfaceGridVisible).toBeUndefined();
@@ -736,6 +743,9 @@ describe("SpaceTimeRenderer", () => {
       rendererFactory: () => backend
     });
     renderer.setSolution(makeGrid());
+    const plane = renderer.scene.getObjectByName("draggable-time-plane") as THREE.Mesh;
+    expect(plane.position.x).toBe(-5);
+    expect((plane.material as THREE.MeshBasicMaterial).forceSinglePass).toBe(true);
     render.mockClear();
 
     renderer.setCharacteristics(makeTrace(), { deferRender: true });
@@ -769,13 +779,14 @@ describe("SpaceTimeRenderer", () => {
   it("exposes keyboard time interaction through the shared timeline callback", () => {
     const host = sizedHost(900, 560);
     const canvas = document.createElement("canvas");
+    const render = vi.fn();
     const backend = {
       domElement: canvas,
       outputColorSpace: THREE.SRGBColorSpace,
       setPixelRatio: vi.fn(),
       setSize: vi.fn(),
       setClearColor: vi.fn(),
-      render: vi.fn(),
+      render,
       dispose: vi.fn()
     } as unknown as THREE.WebGLRenderer;
     const onInteractionStart = vi.fn();
@@ -786,6 +797,8 @@ describe("SpaceTimeRenderer", () => {
       onTimeChange
     });
     renderer.setSolution(makeGrid());
+    const plane = renderer.scene.getObjectByName("draggable-time-plane") as THREE.Mesh;
+    expect(plane.position.x).toBe(-5);
 
     expect(backend.setClearColor).toHaveBeenCalledWith(0x000000, 1);
     expect(canvas.dataset.defaultView).toBe("low-oblique-u-left-t-left-edge");
@@ -807,10 +820,18 @@ describe("SpaceTimeRenderer", () => {
     expect(canvas.dataset.surfaceLighting).toBe("hemisphere-key-underfill");
     expect(canvas.dataset.surfaceUndersideFill).toBe("true");
     expect(canvas.dataset.surfacePass).toBe("single");
+    expect(canvas.dataset.webglAntialias).toBe("false");
+    expect(canvas.dataset.webglResolutionScale).toBe("0.9");
     expect(host.dataset.surfaceGridVisible).toBeUndefined();
     expect(canvas.dataset.surfaceGridVisible).toBeUndefined();
 
-    const plane = renderer.scene.getObjectByName("draggable-time-plane") as THREE.Mesh;
+    render.mockClear();
+    renderer.setTime(0);
+    expect(render).not.toHaveBeenCalled();
+    renderer.setTime(0.5);
+    expect(render).toHaveBeenCalledTimes(1);
+    render.mockClear();
+
     const raycaster = (renderer as unknown as { raycaster: THREE.Raycaster }).raycaster;
     const planeIntersection = {
       distance: 1,
