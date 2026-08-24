@@ -110,7 +110,6 @@ export class SnapshotRenderer {
     this.geometry = this.measure();
 
     const id = ++nextSnapshotRendererId;
-    const titleId = `wave-snapshot-title-${id}`;
     const descriptionId = `wave-snapshot-description-${id}`;
     const clipId = `wave-snapshot-clip-${id}`;
     const xAxisArrowId = `wave-snapshot-x-axis-arrow-${id}`;
@@ -120,7 +119,8 @@ export class SnapshotRenderer {
     setSvgAttributes(this.svg, {
       role: "application",
       tabindex: 0,
-      "aria-labelledby": `${titleId} ${descriptionId}`,
+      "aria-label": this.options.ariaLabel,
+      "aria-describedby": descriptionId,
       preserveAspectRatio: "none",
       focusable: "true",
       "data-geometry-ready": "false",
@@ -133,14 +133,11 @@ export class SnapshotRenderer {
       height: "100%"
     });
 
-    const title = createSvgElement("title");
-    title.id = titleId;
-    title.textContent = this.options.ariaLabel;
     this.descriptionElement = createSvgElement("desc");
     this.descriptionElement.id = descriptionId;
     this.descriptionElement.textContent =
       "A spatial snapshot of u as a function of x. Click the curve or focus this plot and use the arrow keys to select a point.";
-    this.svg.append(title, this.descriptionElement);
+    this.svg.append(this.descriptionElement);
 
     const definitions = createSvgElement("defs");
     const clipPath = createSvgElement("clipPath");

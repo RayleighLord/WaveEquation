@@ -99,11 +99,9 @@ describe("KaTeX interface typography", () => {
     expect(page.querySelector<HTMLInputElement>("#final-time-input")?.type).toBe("text");
     expect(page.querySelector<HTMLInputElement>("#view-x-min-input")?.type).toBe("text");
     expect(page.querySelector<HTMLInputElement>("#view-x-max-input")?.type).toBe("text");
-    expect(page.querySelector<HTMLInputElement>("#domain-left-input")?.title).toContain("sin(pi/2)");
-    expect(page.querySelector<HTMLInputElement>("#domain-right-input")?.title).toContain("pi");
-    expect(page.querySelector<HTMLInputElement>("#final-time-input")?.title).toContain("2 * pi");
-    expect(page.querySelector<HTMLInputElement>("#view-x-min-input")?.title).toContain("-pi");
-    expect(page.querySelector<HTMLInputElement>("#view-x-max-input")?.title).toContain("pi");
+    expect(page.querySelectorAll("[title]")).toHaveLength(0);
+    expect(page.querySelector("#restart-button")?.getAttribute("aria-keyshortcuts")).toBe("R");
+    expect(page.querySelector("#ui-toggle")?.getAttribute("aria-keyshortcuts")).toBe("H");
     const viewBoundsRow = page.querySelector(".view-bounds-row");
     expect(viewBoundsRow?.parentElement?.classList.contains("field-grid--domain")).toBe(true);
     expect(Array.from(viewBoundsRow?.children ?? []).map((field) => field.getAttribute("for")))

@@ -32,6 +32,21 @@ describe("Snapshot presentation", () => {
     renderer.dispose();
   });
 
+  it("keeps its accessible description without an SVG hover tooltip", () => {
+    const host = sizedHost(800, 260);
+    const renderer = new SnapshotRenderer(host, {
+      ariaLabel: "Wave profile at the selected time"
+    });
+
+    expect(renderer.svg.querySelector("title")).toBeNull();
+    expect(renderer.svg.getAttribute("aria-label")).toBe("Wave profile at the selected time");
+    const descriptionId = renderer.svg.getAttribute("aria-describedby");
+    expect(descriptionId).toMatch(/^wave-snapshot-description-\d+$/);
+    expect(renderer.svg.querySelector(`#${descriptionId}`)?.tagName.toLowerCase()).toBe("desc");
+
+    renderer.dispose();
+  });
+
   it("centers a half-width desktop plot and enlarges only the time numerals by 1.5x", () => {
     const styles = readFileSync("src/styles/main.css", "utf8");
     const snapshotRule = ruleBody(styles, "#snapshot-section");

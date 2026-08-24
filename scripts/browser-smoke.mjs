@@ -102,6 +102,21 @@ async function assertHealthyInitialRender(page) {
   assert.equal(await page.locator("#app-title").evaluate((node) => node.tagName), "H1");
   assert.equal(await page.locator("#surface-plot").getAttribute("aria-busy"), "false");
   assert.equal(await page.locator(".snapshot-svg").count(), 1);
+  assert.equal(
+    await page.locator("[title]").count(),
+    0,
+    "Editable fields and controls must not expose native hover messages."
+  );
+  assert.equal(
+    await page.locator(".snapshot-svg title").count(),
+    0,
+    "The 2D plot must not expose an SVG hover message."
+  );
+  assert.equal(await page.locator(".snapshot-svg desc").count(), 1);
+  assert.equal(
+    await page.locator(".snapshot-svg").getAttribute("aria-label"),
+    "Wave profile snapshot"
+  );
   assert.ok(
     ((await page.locator(".snapshot-curve").getAttribute("d")) ?? "").length > 20,
     "The synchronized snapshot curve did not render."
@@ -1454,9 +1469,8 @@ async function assertCharacteristics(page) {
         label.getAttribute("data-latex-source") ?? "",
         label.textContent ?? ""
       ]);
-    const svgAccessibleText = [
-      ...document.querySelectorAll(".snapshot-svg title, .snapshot-svg desc")
-    ].map((label) => label.textContent ?? "");
+    const svgAccessibleText = [...document.querySelectorAll(".snapshot-svg desc")]
+      .map((label) => label.textContent ?? "");
     return [...css2d, ...svgAccessibleText].join("\n");
   });
   assert.doesNotMatch(
