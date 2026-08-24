@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.vite/
+.playwright-cli/
+output/playwright/
+output/showcase/.playwright-cli/
+output/showcase/*.webm
+output/showcase/*.mp4
+output/showcase/*.tmp.gif
+*.log
+.DS_Store

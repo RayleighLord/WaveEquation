@@ -1,0 +1,357 @@
+<!doctype html>
+<html
+  lang="en"
+  data-geometry-ready="false"
+  data-current-time="0"
+  data-playback="paused"
+  data-problem-open="true"
+  data-characteristics="off"
+  data-accepted-revision="0"
+  data-solve-ms="0"
+  data-frame-sample="0"
+  data-webgl="unknown"
+>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta
+      name="description"
+      content="Explore solutions and characteristics of the one-dimensional homogeneous wave equation."
+    />
+    <meta name="theme-color" content="#020708" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23020708'/%3E%3Cpath d='M7 35c8-21 14 21 23 0s15 21 27 0' fill='none' stroke='%235de1d4' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+    <title>Wave Equation</title>
+  </head>
+  <body data-ui-hidden="false">
+    <a class="skip-link" href="#wave-stage">Skip to the visualization</a>
+
+    <div id="app-shell" class="app-shell">
+      <header id="problem-control" class="problem-control ui-chrome">
+        <div class="problem-control__header">
+          <h1 id="app-title" class="app-title">Wave Equation</h1>
+          <button
+            id="problem-toggle"
+            class="glass-button compact-button problem-toggle"
+            type="button"
+            aria-controls="problem-menu"
+            aria-expanded="true"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 6.5h10v2H4v-2Zm0 4.5h16v2H4v-2Zm0 4.5h12v2H4v-2Zm14-10 2 2-5.8 5.8-2.6.6.6-2.6L18 5.5Z" />
+            </svg>
+            <span data-problem-toggle-label>Edit problem</span>
+          </button>
+        </div>
+
+        <section
+          id="problem-formula"
+          class="problem-formula glass-panel"
+          role="math"
+          aria-label="Homogeneous wave equation problem"
+        >
+          <div id="problem-formula-math" class="problem-formula__math" data-latex="\begin{cases}u_{tt}-u_{xx}=0,\qquad (x,t)\in \mathbb{R}\times(0,T]\\u(x,0)=f(x),\qquad u_t(x,0)=g(x)\end{cases}">
+            <span aria-hidden="true">uₜₜ − uₓₓ = 0, u(x,0) = f(x), uₜ(x,0) = g(x)</span>
+          </div>
+        </section>
+
+        <section
+          id="problem-menu"
+          class="problem-menu glass-panel"
+          aria-labelledby="problem-title"
+        >
+          <header class="panel-heading">
+            <h2 id="problem-title">Problem setup</h2>
+            <button id="problem-close" class="icon-button" type="button" aria-label="Close problem editor">×</button>
+          </header>
+
+          <form id="problem-form" novalidate>
+            <div class="field-row preset-row">
+              <label for="preset-select">Example</label>
+              <select id="preset-select" name="preset" aria-label="Wave equation example">
+                <option value="gaussian-split">Gaussian Pulse</option>
+                <option value="square-wave">Square Wave</option>
+                <option value="fixed-end">One-Sided Pulse</option>
+                <option value="standing-wave">Finite standing wave</option>
+                <option value="mixed-boundaries">Mixed boundaries</option>
+                <option value="boundary-driven">Forced Wave</option>
+                <option value="custom">Custom</option>
+              </select>
+            </div>
+
+            <div class="field-grid field-grid--domain">
+              <label class="field" for="domain-select">
+                <span>Domain</span>
+                <select id="domain-select" name="domain">
+                  <option value="infinite">Infinite</option>
+                  <option value="right-half-line">Semi-infinite</option>
+                  <option value="finite">Finite</option>
+                </select>
+              </label>
+              <label class="field" for="final-time-input">
+                <span>Final time, <span class="inline-math" data-latex="T">T</span></span>
+                <input id="final-time-input" name="finalTime" type="text" value="8" inputmode="text" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" title="Constant expressions such as 2 * pi are supported." />
+              </label>
+              <label id="domain-left-field" class="field domain-bound-field" for="domain-left-input" hidden>
+                <span>Left endpoint, <span class="inline-math" data-latex="a">a</span></span>
+                <input id="domain-left-input" name="domainLeft" type="text" value="0" inputmode="text" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" title="Constant expressions such as pi or sin(pi/2) are supported." />
+              </label>
+              <label id="domain-right-field" class="field domain-bound-field" for="domain-right-input" hidden>
+                <span>Right endpoint, <span class="inline-math" data-latex="b">b</span></span>
+                <input id="domain-right-input" name="domainRight" type="text" value="4" inputmode="text" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" title="Constant expressions such as pi or sin(pi/2) are supported." />
+              </label>
+              <div class="view-bounds-row">
+                <label class="field" for="view-x-min-input">
+                  <span>View <span class="inline-math" data-latex="x_{\min}">x min</span></span>
+                  <input id="view-x-min-input" name="viewXMin" type="text" value="-6" inputmode="text" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" title="Constant expressions such as -pi are supported." />
+                </label>
+                <label class="field" for="view-x-max-input">
+                  <span>View <span class="inline-math" data-latex="x_{\max}">x max</span></span>
+                  <input id="view-x-max-input" name="viewXMax" type="text" value="6" inputmode="text" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" title="Constant expressions such as pi are supported." />
+                </label>
+              </div>
+            </div>
+
+            <fieldset class="piece-editor" data-piece-editor="displacement">
+              <legend><span id="displacement-label">Initial displacement</span> <span class="math-hint" data-latex="f(x)">f(x)</span></legend>
+              <div class="piece-headings" aria-hidden="true">
+                <span>Expression</span><span>From</span><span>To</span><span></span>
+              </div>
+              <div id="displacement-piece-list" class="piece-list">
+                <div class="piece-row" data-piece-kind="displacement" data-piece-index="0">
+                  <label class="piece-field">
+                    <span class="mobile-field-label">Expression</span>
+                    <input class="piece-expression" name="displacementExpression0" type="text" value="exp(-4 * x^2)" aria-label="Initial displacement expression" spellcheck="false" />
+                  </label>
+                  <label class="piece-field">
+                    <span class="mobile-field-label">From</span>
+                    <input class="piece-lower" name="displacementLower0" type="text" value="-inf" aria-label="Initial displacement lower bound" spellcheck="false" />
+                  </label>
+                  <label class="piece-field">
+                    <span class="mobile-field-label">To</span>
+                    <input class="piece-upper" name="displacementUpper0" type="text" value="inf" aria-label="Initial displacement upper bound" spellcheck="false" />
+                  </label>
+                  <button class="remove-piece-button" type="button" aria-label="Remove initial displacement interval" disabled>×</button>
+                </div>
+              </div>
+              <button id="add-displacement-piece" class="soft-button add-piece-button" type="button">+ Add interval</button>
+            </fieldset>
+
+            <fieldset class="piece-editor" data-piece-editor="velocity">
+              <legend><span id="velocity-label">Initial velocity</span> <span class="math-hint" data-latex="g(x)">g(x)</span></legend>
+              <div class="piece-headings" aria-hidden="true">
+                <span>Expression</span><span>From</span><span>To</span><span></span>
+              </div>
+              <div id="velocity-piece-list" class="piece-list">
+                <div class="piece-row" data-piece-kind="velocity" data-piece-index="0">
+                  <label class="piece-field">
+                    <span class="mobile-field-label">Expression</span>
+                    <input class="piece-expression" name="velocityExpression0" type="text" value="0" aria-label="Initial velocity expression" spellcheck="false" />
+                  </label>
+                  <label class="piece-field">
+                    <span class="mobile-field-label">From</span>
+                    <input class="piece-lower" name="velocityLower0" type="text" value="-inf" aria-label="Initial velocity lower bound" spellcheck="false" />
+                  </label>
+                  <label class="piece-field">
+                    <span class="mobile-field-label">To</span>
+                    <input class="piece-upper" name="velocityUpper0" type="text" value="inf" aria-label="Initial velocity upper bound" spellcheck="false" />
+                  </label>
+                  <button class="remove-piece-button" type="button" aria-label="Remove initial velocity interval" disabled>×</button>
+                </div>
+              </div>
+              <button id="add-velocity-piece" class="soft-button add-piece-button" type="button">+ Add interval</button>
+            </fieldset>
+
+            <div class="boundary-grid">
+              <fieldset id="left-boundary-fields" class="boundary-fields" hidden>
+                <legend>Left boundary, <span class="inline-math" data-latex="x=a">x = a</span></legend>
+                <label class="field" for="left-boundary-type">
+                  <span>Condition</span>
+                  <select id="left-boundary-type" name="leftBoundaryType">
+                    <option value="dirichlet">Dirichlet</option>
+                    <option value="neumann">Neumann</option>
+                  </select>
+                </label>
+                <label class="field" for="left-boundary-expression">
+                  <span>Data, <span id="left-boundary-symbol" class="inline-math" data-latex="h_L(t)">h_L(t)</span></span>
+                  <input id="left-boundary-expression" name="leftBoundaryExpression" type="text" value="0" spellcheck="false" aria-label="Left boundary data h sub L of t" />
+                </label>
+              </fieldset>
+
+              <fieldset id="right-boundary-fields" class="boundary-fields" hidden>
+                <legend>Right boundary, <span class="inline-math" data-latex="x=b">x = b</span></legend>
+                <label class="field" for="right-boundary-type">
+                  <span>Condition</span>
+                  <select id="right-boundary-type" name="rightBoundaryType">
+                    <option value="dirichlet">Dirichlet</option>
+                    <option value="neumann">Neumann</option>
+                  </select>
+                </label>
+                <label class="field" for="right-boundary-expression">
+                  <span>Data, <span id="right-boundary-symbol" class="inline-math" data-latex="h_R(t)">h_R(t)</span></span>
+                  <input id="right-boundary-expression" name="rightBoundaryExpression" type="text" value="0" spellcheck="false" aria-label="Right boundary data h sub R of t" />
+                </label>
+              </fieldset>
+            </div>
+
+            <div class="problem-feedback" aria-live="polite" aria-atomic="true">
+              <span id="source-status" class="status-chip is-pending">Preparing the solution…</span>
+              <ul id="problem-warnings" class="problem-warnings" hidden></ul>
+            </div>
+          </form>
+        </section>
+      </header>
+
+      <main id="wave-stage" class="wave-stage" aria-label="Wave equation solution and snapshot">
+        <section id="surface-section" class="surface-section plot-panel" aria-labelledby="surface-title">
+          <h2 id="surface-title" class="visually-hidden">Solution over space and time</h2>
+          <div id="surface-plot" class="surface-plot" aria-busy="true" aria-describedby="surface-description"></div>
+          <p id="surface-description" class="visually-hidden">
+            A three-dimensional plot of u over the x and t plane. Drag the gold time plane to choose a snapshot.
+          </p>
+          <div id="solve-loading" class="solve-loading glass-panel" role="status" aria-live="polite">
+            <span class="loading-pulse" aria-hidden="true"></span>
+            <span>Solving the wave equation…</span>
+          </div>
+          <p id="webgl-notice" class="webgl-notice glass-panel" role="status" hidden>
+            The 3D view needs WebGL. The synchronized snapshot remains available below.
+          </p>
+        </section>
+
+        <section id="snapshot-section" class="snapshot-section plot-panel" aria-labelledby="snapshot-title">
+          <h2 id="snapshot-title" class="visually-hidden">Wave profile at the selected time</h2>
+          <div id="snapshot-plot" class="snapshot-plot" aria-describedby="snapshot-description"></div>
+          <p id="snapshot-description" class="visually-hidden">
+            A two-dimensional plot of displacement u against position x at the selected time.
+          </p>
+        </section>
+      </main>
+
+      <nav id="view-controls" class="view-controls ui-chrome" aria-label="Visualization controls">
+        <button id="restart-button" class="glass-button compact-button" type="button" title="Restart evolution (R)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.4 7.2A8 8 0 1 1 4 12h2.2a5.8 5.8 0 1 0 1.1-3.4L10 11H3V4l2.4 3.2Z" /></svg>
+          <span>Restart</span>
+        </button>
+        <button id="reset-camera-button" class="glass-button compact-button" type="button" title="Reset 3D camera">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.4 7.2A8 8 0 1 1 4 12h2.2a5.8 5.8 0 1 0 1.1-3.4L10 11H3V4l2.4 3.2Z" /></svg>
+          <span>Reset view</span>
+        </button>
+        <button
+          id="characteristics-button"
+          class="glass-button compact-button"
+          type="button"
+          aria-pressed="false"
+          aria-expanded="false"
+          aria-controls="characteristics-entry"
+          title="Select a point and trace its characteristics"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 19 7.1-7.1L4.2 5 5.6 3.6l6.9 6.9 5.9-5.9L20 6.2l-6.1 6.1 6.2 6.2-1.4 1.4-6.2-6.2L5.4 21 4 19Z" /></svg>
+          <span>Characteristics</span>
+        </button>
+        <button
+          id="ui-toggle"
+          class="glass-button compact-button"
+          type="button"
+          aria-pressed="false"
+          aria-label="Hide interface"
+          title="Hide interface (H)"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.2 12s3.6-6 9.8-6 9.8 6 9.8 6-3.6 6-9.8 6-9.8-6-9.8-6Zm9.8 3.2A3.2 3.2 0 1 0 12 8.8a3.2 3.2 0 0 0 0 6.4Z" /></svg>
+          <span data-ui-label>Hide UI</span>
+        </button>
+      </nav>
+
+      <section
+        id="characteristics-entry"
+        class="characteristics-entry glass-panel ui-chrome"
+        aria-labelledby="characteristics-entry-title"
+        hidden
+      >
+        <form id="characteristic-point-form" class="characteristic-point-form" novalidate>
+          <div class="characteristics-entry__heading">
+            <h2 id="characteristics-entry-title">Trace a point</h2>
+            <span>Use pi, log(2), … or choose on the curve.</span>
+          </div>
+          <div class="characteristic-point-grid">
+            <label class="characteristic-point-field" for="characteristic-x-input">
+              <span class="inline-math" data-latex="x_*">x*</span>
+              <input
+                id="characteristic-x-input"
+                name="characteristicX"
+                type="text"
+                value="0"
+                spellcheck="false"
+                autocomplete="off"
+                inputmode="text"
+                autocapitalize="off"
+                aria-describedby="characteristic-entry-feedback"
+                aria-label="Characteristic point x coordinate"
+              />
+            </label>
+            <label class="characteristic-point-field" for="characteristic-t-input">
+              <span class="inline-math" data-latex="t_*">t*</span>
+              <input
+                id="characteristic-t-input"
+                name="characteristicT"
+                type="text"
+                value="0"
+                spellcheck="false"
+                autocomplete="off"
+                inputmode="text"
+                autocapitalize="off"
+                aria-describedby="characteristic-entry-feedback"
+                aria-label="Characteristic point time coordinate"
+              />
+            </label>
+          </div>
+          <div class="characteristic-entry-actions">
+            <button id="trace-characteristic-point" class="soft-button" type="submit">Trace</button>
+            <button id="choose-characteristic-on-curve" class="soft-button characteristic-curve-button" type="button">Choose on curve</button>
+          </div>
+          <p
+            id="characteristic-entry-feedback"
+            class="characteristic-entry-feedback"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >Ready to trace.</p>
+        </form>
+      </section>
+
+      <section id="time-control" class="time-control glass-panel ui-chrome" aria-label="Selected time">
+        <div class="time-heading">
+          <button id="playback-button" class="playback-button" type="button" aria-pressed="false" aria-label="Play evolution">
+            <svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7V5Z" /></svg>
+            <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7V5Zm6 0h4v14h-4V5Z" /></svg>
+            <svg class="replay-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.4 7.2A8 8 0 1 1 4 12h2.2a5.8 5.8 0 1 0 1.1-3.4L10 11H3V4l2.4 3.2Z" /></svg>
+            <span data-playback-label>Play</span>
+          </button>
+          <label for="time-slider"><span class="time-label">Time <span class="inline-math" data-latex="t">t</span></span></label>
+          <output id="time-output" class="math-output" for="time-slider" role="timer" aria-live="off" aria-label="Time 0.000">t = 0.000</output>
+        </div>
+        <div class="time-slider-wrap">
+          <input
+            id="time-slider"
+            type="range"
+            min="0"
+            max="1000"
+            step="1"
+            value="0"
+            aria-valuemin="0"
+            aria-valuemax="8"
+            aria-valuenow="0"
+            aria-valuetext="time 0.000"
+          />
+          <div id="time-ticks" class="time-ticks" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <button id="restore-ui" class="glass-button restore-ui" type="button" hidden>Show UI</button>
+      <p id="interaction-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
