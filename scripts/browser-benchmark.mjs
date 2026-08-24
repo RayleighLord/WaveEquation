@@ -15,6 +15,14 @@ const TARGET_FIRST_SURFACE_MS = Number(
 const TARGET_FRAME_MS = Number(process.env.BENCHMARK_FRAME_MS ?? 16.7);
 const TARGET_LONG_TASK_MS = Number(process.env.BENCHMARK_LONG_TASK_MS ?? 50);
 const INITIAL_RUNS = positiveInteger(process.env.BENCHMARK_INITIAL_RUNS, 3);
+const TIME_UPDATE_REPEATS = positiveInteger(
+  process.env.BENCHMARK_UPDATE_REPEATS,
+  1
+);
+const MEASUREMENT_COMPLETION_TIMEOUT_MS = positiveInteger(
+  process.env.BENCHMARK_MEASUREMENT_TIMEOUT_MS,
+  15_000
+);
 const ENFORCE_TARGETS = process.env.BENCHMARK_ENFORCE === "1";
 const port = Number(
   process.env.BROWSER_BENCHMARK_PORT ?? 35_000 + (process.pid % 10_000)
@@ -29,6 +37,7 @@ await prepareArtifacts();
 let browser;
 let context;
 let page;
+let benchmarkSignalSequence = 0;
 
 try {
   browser = await launchChromium();
@@ -66,8 +75,12 @@ try {
   const slider = page.locator("#time-slider");
   const sliderMaximum = Number(await slider.getAttribute("max"));
   assert.ok(Number.isFinite(sliderMaximum) && sliderMaximum > 0);
-  const values = [0.08, 0.2, 0.36, 0.52, 0.7, 0.9, 0.42, 0.16, 0.63, 0.3]
+  const updateCycle = [0.08, 0.2, 0.36, 0.52, 0.7, 0.9, 0.42, 0.16, 0.63, 0.3]
     .map((fraction) => Math.round(sliderMaximum * fraction));
+  const values = Array.from(
+    { length: TIME_UPDATE_REPEATS },
+    () => updateCycle
+  ).flat();
 
   await settleRetainedTimeRenderer(page);
   const timeMeasurement = await measureTimeUpdates(page, values);
@@ -103,6 +116,7 @@ try {
       characteristicLongTasks
     });
     console.log("Characteristic stages", characteristicMeasurement.stages);
+    console.log("Time update samples", updateSamples);
   }
 
   const solveMedian = median(initialSamples.map(({ solveMs }) => solveMs));
@@ -220,22 +234,38 @@ try {
 }
 
 async function measureTimeUpdates(page, values) {
-  // Install the complete sequence, then leave the page alone while it runs.
-  // This keeps CDP polling/evaluation tasks out of the Long Task window.
-  await page.evaluate((nextValues) => {
+  // The page owns the complete sequence and emits one protocol event only
+  // after its final frame. The host waits without polling or keeping a pending
+  // Runtime.evaluate call inside the Long Task observation window.
+  const signal = nextBenchmarkSignal("time");
+  const completion = waitForBenchmarkSignal(page, signal, "Time-update benchmark");
+  const start = page.evaluate(({ nextValues, signal }) => {
     window.__waveTimeBenchmark = null;
+    window.__waveTimeBenchmarkProgress = {
+      completed: 0,
+      expected: nextValues.length
+    };
     const input = document.querySelector("#time-slider");
     if (!(input instanceof HTMLInputElement)) {
       throw new Error("#time-slider must be an input.");
     }
     const root = document.documentElement;
     const samples = [];
+    let activeObserver = null;
+    let cancelled = false;
+    window.__waveCancelBenchmark = () => {
+      cancelled = true;
+      activeObserver?.disconnect();
+    };
     const run = (index) => {
+      if (cancelled) return;
       if (index >= nextValues.length) {
         window.__waveTimeBenchmark = {
           samples,
           finishedAt: performance.now()
         };
+        delete window.__waveCancelBenchmark;
+        window.setTimeout(() => console.debug(signal), 0);
         return;
       }
       const value = nextValues[index];
@@ -246,16 +276,22 @@ async function measureTimeUpdates(page, values) {
       const observer = new MutationObserver(() => {
         if (Number(root.dataset.frameSample) <= previousFrame) return;
         observer.disconnect();
+        activeObserver = null;
+        const finishedAt = performance.now();
         samples.push({
           value,
+          startedAt,
+          finishedAt,
           dispatchMs,
-          latencyMs: performance.now() - startedAt,
+          latencyMs: finishedAt - startedAt,
           frameDurations: (window.__waveRafDurations ?? [])
             .slice(frameStartIndex)
             .map(({ duration }) => duration)
         });
+        window.__waveTimeBenchmarkProgress.completed = samples.length;
         window.requestAnimationFrame(() => run(index + 1));
       });
+      activeObserver = observer;
       observer.observe(root, {
         attributes: true,
         attributeFilter: ["data-frame-sample"]
@@ -268,8 +304,8 @@ async function measureTimeUpdates(page, values) {
       window.__waveResetLongTasks?.();
       window.requestAnimationFrame(() => run(0));
     }, 0);
-  }, values);
-  await nodePause(1_200);
+  }, { nextValues: values, signal });
+  await Promise.all([completion, start]);
   const measurement = await page.evaluate(() => window.__waveTimeBenchmark);
   assert.ok(measurement, "The in-page time-update benchmark did not finish.");
   assert.equal(measurement.samples.length, values.length);
@@ -298,7 +334,9 @@ async function settleRetainedTimeRenderer(page) {
 }
 
 async function measurePresetSelection(page, preset) {
-  await page.evaluate((nextPreset) => {
+  const signal = nextBenchmarkSignal(`preset-${preset}`);
+  const completion = waitForBenchmarkSignal(page, signal, `Preset ${preset}`);
+  const start = page.evaluate(({ nextPreset, signal }) => {
     window.__wavePresetBenchmark = null;
     const select = document.querySelector("#preset-select");
     if (!(select instanceof HTMLSelectElement)) {
@@ -306,18 +344,28 @@ async function measurePresetSelection(page, preset) {
     }
     const root = document.documentElement;
     const previousRevision = Number(root.dataset.acceptedRevision);
+    let observer = null;
+    let cancelled = false;
+    window.__waveCancelBenchmark = () => {
+      cancelled = true;
+      observer?.disconnect();
+    };
     window.setTimeout(() => {
+      if (cancelled) return;
       window.__waveResetLongTasks?.();
       window.setTimeout(() => {
+        if (cancelled) return;
         const startedAt = performance.now();
-        const observer = new MutationObserver(() => {
+        observer = new MutationObserver(() => {
           if (Number(root.dataset.acceptedRevision) <= previousRevision) return;
-          observer.disconnect();
+          observer?.disconnect();
           window.__wavePresetBenchmark = {
             latencyMs: performance.now() - startedAt,
             finishedAt: performance.now(),
             revision: Number(root.dataset.acceptedRevision)
           };
+          delete window.__waveCancelBenchmark;
+          window.setTimeout(() => console.debug(signal), 0);
         });
         observer.observe(root, {
           attributes: true,
@@ -327,22 +375,17 @@ async function measurePresetSelection(page, preset) {
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }, 0);
     }, 0);
-  }, preset);
-  await nodePause(1_200);
-  const measurement = await page.evaluate(() => ({
-    result: window.__wavePresetBenchmark,
-    status: document.querySelector("#source-status")?.textContent,
-    preset: document.querySelector("#preset-select")?.value
-  }));
-  assert.ok(
-    measurement.result,
-    `Preset benchmark did not finish: ${measurement.preset}, ${measurement.status}`
-  );
-  return measurement.result;
+  }, { nextPreset: preset, signal });
+  await Promise.all([completion, start]);
+  const measurement = await page.evaluate(() => window.__wavePresetBenchmark);
+  assert.ok(measurement, `Preset benchmark did not finish for ${preset}.`);
+  return measurement;
 }
 
 async function measureScalarCommit(page, source) {
-  await page.evaluate((nextSource) => {
+  const signal = nextBenchmarkSignal(`scalar-${source}`);
+  const completion = waitForBenchmarkSignal(page, signal, `Scalar benchmark for T=${source}`);
+  const start = page.evaluate(({ nextSource, signal }) => {
     window.__waveScalarBenchmark = null;
     const input = document.querySelector("#final-time-input");
     if (!(input instanceof HTMLInputElement)) {
@@ -350,12 +393,19 @@ async function measureScalarCommit(page, source) {
     }
     const root = document.documentElement;
     const previousRevision = Number(root.dataset.acceptedRevision);
+    let observer = null;
+    let cancelled = false;
+    window.__waveCancelBenchmark = () => {
+      cancelled = true;
+      observer?.disconnect();
+    };
     window.setTimeout(() => {
+      if (cancelled) return;
       window.__waveResetLongTasks?.();
       const startedAt = performance.now();
-      const observer = new MutationObserver(() => {
+      observer = new MutationObserver(() => {
         if (Number(root.dataset.acceptedRevision) <= previousRevision) return;
-        observer.disconnect();
+        observer?.disconnect();
         window.__waveScalarBenchmark = {
           latencyMs: performance.now() - startedAt,
           finishedAt: performance.now(),
@@ -363,6 +413,8 @@ async function measureScalarCommit(page, source) {
           solverXSamples: Number(root.dataset.solverXSamples),
           solverTSamples: Number(root.dataset.solverTSamples)
         };
+        delete window.__waveCancelBenchmark;
+        window.setTimeout(() => console.debug(signal), 0);
       });
       observer.observe(root, {
         attributes: true,
@@ -371,15 +423,17 @@ async function measureScalarCommit(page, source) {
       input.value = nextSource;
       input.dispatchEvent(new Event("input", { bubbles: true }));
     }, 0);
-  }, source);
-  await nodePause(1_400);
+  }, { nextSource: source, signal });
+  await Promise.all([completion, start]);
   const measurement = await page.evaluate(() => window.__waveScalarBenchmark);
   assert.ok(measurement, `Scalar benchmark did not finish for T=${source}.`);
   return measurement;
 }
 
 async function measureCharacteristicSelection(page) {
-  await page.evaluate(() => {
+  const signal = nextBenchmarkSignal("characteristics");
+  const completion = waitForBenchmarkSignal(page, signal, "Characteristic benchmark");
+  const start = page.evaluate((signal) => {
     window.__waveCharacteristicBenchmark = null;
     const root = document.documentElement;
     const button = document.querySelector("#characteristics-button");
@@ -387,20 +441,29 @@ async function measureCharacteristicSelection(page) {
     if (!(button instanceof HTMLButtonElement) || !(hitArea instanceof SVGGraphicsElement)) {
       throw new Error("Characteristic controls are unavailable.");
     }
+    let observer = null;
+    let cancelled = false;
+    window.__waveCancelBenchmark = () => {
+      cancelled = true;
+      observer?.disconnect();
+    };
     window.setTimeout(() => {
+      if (cancelled) return;
       button.click();
       window.requestAnimationFrame(() => {
         // Opening the compact KaTeX-rich menu and choosing a curve point are
         // separate user gestures. Let the browser paint the opened menu once,
         // then start a fresh observation window for the point gesture itself.
         window.requestAnimationFrame(() => {
+          if (cancelled) return;
           window.__waveResetLongTasks?.();
           window.setTimeout(() => {
+            if (cancelled) return;
             const bounds = hitArea.getBoundingClientRect();
             const startedAt = performance.now();
-            const observer = new MutationObserver(() => {
+            observer = new MutationObserver(() => {
               if (root.dataset.characteristics !== "active") return;
-              observer.disconnect();
+              observer?.disconnect();
               window.__waveCharacteristicBenchmark = {
                 latencyMs: performance.now() - startedAt,
                 finishedAt: performance.now(),
@@ -412,6 +475,8 @@ async function measureCharacteristicSelection(page) {
                   snapshotMs: Number(root.dataset.traceSnapshotMs)
                 }
               };
+              delete window.__waveCancelBenchmark;
+              window.setTimeout(() => console.debug(signal), 0);
             });
             observer.observe(root, {
               attributes: true,
@@ -428,8 +493,8 @@ async function measureCharacteristicSelection(page) {
         });
       });
     }, 0);
-  });
-  await nodePause(800);
+  }, signal);
+  await Promise.all([completion, start]);
   const measurement = await page.evaluate(() => window.__waveCharacteristicBenchmark);
   assert.ok(measurement, "The characteristic benchmark did not finish.");
   return measurement;
@@ -465,7 +530,15 @@ async function createInstrumentedContext(browser) {
           window.__waveLongTasks.push({
             startedAt: entry.startTime,
             duration: entry.duration,
-            cutoff: window.__waveLongTaskCutoff ?? 0
+            cutoff: window.__waveLongTaskCutoff ?? 0,
+            name: entry.name,
+            attribution: [...(entry.attribution ?? [])].map((item) => ({
+              name: item.name,
+              containerType: item.containerType,
+              containerName: item.containerName,
+              containerId: item.containerId,
+              containerSrc: item.containerSrc
+            }))
           });
         }
       });
@@ -507,7 +580,15 @@ async function takeLongTasks(page, finishedAt) {
       window.__waveLongTasks.push({
         startedAt: entry.startTime,
         duration: entry.duration,
-        cutoff
+        cutoff,
+        name: entry.name,
+        attribution: [...(entry.attribution ?? [])].map((item) => ({
+          name: item.name,
+          containerType: item.containerType,
+          containerName: item.containerName,
+          containerId: item.containerId,
+          containerSrc: item.containerSrc
+        }))
       });
     }
     return (window.__waveLongTasks ?? []).filter(
@@ -516,8 +597,43 @@ async function takeLongTasks(page, finishedAt) {
   }, finishedAt);
 }
 
-function nodePause(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function nextBenchmarkSignal(label) {
+  benchmarkSignalSequence += 1;
+  return `wave-benchmark:${process.pid}:${benchmarkSignalSequence}:${label}`;
+}
+
+async function waitForBenchmarkSignal(page, signal, label) {
+  try {
+    await page.waitForEvent("console", {
+      predicate: (message) =>
+        message.type() === "debug" && message.text() === signal,
+      timeout: MEASUREMENT_COMPLETION_TIMEOUT_MS
+    });
+  } catch (cause) {
+    const state = await page.evaluate(() => {
+      window.__waveCancelBenchmark?.();
+      delete window.__waveCancelBenchmark;
+      return {
+        timeUpdates: window.__waveTimeBenchmarkProgress ?? {
+          completed: window.__waveTimeBenchmark?.samples?.length ?? 0,
+          expected: "unknown"
+        },
+        frame: document.documentElement.dataset.frameSample ?? "unset",
+        geometry: document.documentElement.dataset.geometryReady ?? "unset",
+        playback: document.documentElement.dataset.playback ?? "unset",
+        revision: document.documentElement.dataset.acceptedRevision ?? "unset",
+        preset: document.querySelector("#preset-select")?.value ?? "missing",
+        status: document.querySelector("#source-status")?.textContent ?? "missing",
+        characteristics: document.documentElement.dataset.characteristics ?? "unset",
+        traceStage: document.documentElement.dataset.traceStage ?? "unset"
+      };
+    });
+    throw new Error(
+      `${label} did not finish within ${MEASUREMENT_COMPLETION_TIMEOUT_MS} ms: ` +
+        JSON.stringify(state),
+      { cause }
+    );
+  }
 }
 
 function maximumDuration(tasks) {
