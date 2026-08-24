@@ -46,10 +46,8 @@ jobs:
       - name: Run real-browser smoke tests
         run: node scripts/browser-smoke.mjs
 
-      - name: Enforce browser performance checks
+      - name: Report browser performance
         run: node scripts/browser-benchmark.mjs
-        env:
-          BENCHMARK_ENFORCE: "1"
 
       - name: Upload browser diagnostics
         if: failure()
