@@ -1,6 +1,6 @@
 import {
   evaluateFiniteConstantExpression,
-  sampleSolution,
+  hasSpatialJump,
   traceCharacteristics,
   waveProblemMayHaveDiscontinuousDisplacement,
   type WavePresetId
@@ -8,6 +8,8 @@ import {
 import {
   SnapshotRenderer,
   SpaceTimeRenderer,
+  createProfileSampler,
+  type ProfileSampler,
   type AxisValueNotation,
   type SurfaceTopology
 } from "./plot";
@@ -27,6 +29,7 @@ import {
   WaveAppController,
   type WaveAppViewModel
 } from "./ui";
+import { AppLifetime } from "./ui/lifetime";
 
 const DRAFT_DEBOUNCE_MS = 260;
 const PLAYBACK_DURATION_MS = 12_000;
@@ -75,8 +78,10 @@ export function parseCharacteristicPointInput(
   };
 }
 
-export function startApp(): void {
+export function startApp(): () => void {
   performance.mark(APP_START_MARK);
+  const lifetime = new AppLifetime();
+  let disposed = false;
 
   const root = document.documentElement;
   const shell = getElement<HTMLElement>("app-shell");
@@ -113,6 +118,7 @@ export function startApp(): void {
   const uiLabel = uiToggle.querySelector<HTMLElement>("[data-ui-label]");
   const restoreUi = getElement<HTMLButtonElement>("restore-ui");
   const interactionStatus = getElement<HTMLElement>("interaction-status");
+  const initialProfileToggle = getElement<HTMLInputElement>("initial-profile-toggle");
   const uiChrome = Array.from(shell.querySelectorAll<HTMLElement>(".ui-chrome"));
 
   renderStaticLatex(shell);
@@ -120,6 +126,7 @@ export function startApp(): void {
   createTimeTicks(timeTicks, Number(timeSlider.getAttribute("aria-valuemax") ?? 3));
 
   root.dataset.geometryReady = "false";
+  delete root.dataset.firstPresentationMs;
   root.dataset.currentTime = "0";
   root.dataset.playback = "paused";
   root.dataset.problemOpen = "true";
@@ -128,10 +135,13 @@ export function startApp(): void {
   root.dataset.frameSample = "0";
   root.dataset.webgl = "pending";
   root.dataset.traceStage = "idle";
+  root.dataset.traceCompletedCount = "0";
+  delete root.dataset.traceTime;
   shell.dataset.uiHidden = "false";
   document.body.dataset.uiHidden = "false";
 
   let currentResult: WaveSolutionGrid | null = null;
+  let profileSampler: ProfileSampler | null = null;
   let acceptedProblem: WaveProblem | null = null;
   let currentTime = 0;
   let playing = false;
@@ -178,6 +188,8 @@ export function startApp(): void {
       setCharacteristicEntryFeedback("Tracing the point selected on the curve.", "ready");
     }
   });
+  snapshotRenderer.setSelectionEnabled(false);
+  snapshotRenderer.setInitialProfileVisible(initialProfileToggle.checked);
   root.dataset.webgl = String(surfaceRenderer.webglAvailable);
   webglNotice.hidden = surfaceRenderer.webglAvailable;
 
@@ -202,8 +214,10 @@ export function startApp(): void {
       setPlaying(false);
       cancelDraftCommit();
       if (controller.addPiece(source)) {
-        window.requestAnimationFrame(() => editor.focusLast(source));
+        lifetime.frame(() => editor.focusLast(source));
         scheduleDraftCommit();
+      } else {
+        editor.focusFirstError();
       }
     },
     onPieceRemove: (source, id) => {
@@ -260,10 +274,12 @@ export function startApp(): void {
     renderedTrace = null;
     lastCharacteristicTime = Number.NEGATIVE_INFINITY;
     characteristicMode = "off";
+    snapshotRenderer.setSelectionEnabled(false);
     characteristicsButton.setAttribute("aria-pressed", "false");
     closeCharacteristicEntry();
     if (characteristicsLabel) characteristicsLabel.textContent = "Characteristics";
     root.dataset.characteristics = "off";
+    characteristicsButton.setAttribute("aria-label", "Characteristics");
     root.dataset.solveMs = result.timings.totalMs.toFixed(3);
     root.dataset.samplingPolicy = "adaptive-wave-v1";
     root.dataset.solverXSamples = String(result.x.length);
@@ -275,13 +291,16 @@ export function startApp(): void {
     }
     acceptedAxisNotation = axisNotation;
     const deferredPresentation = { defer: true } as const;
+    profileSampler = createProfileSampler(problem, result, surfaceTopology);
+    surfaceRenderer.setProfileSampler(profileSampler, deferredPresentation);
+    snapshotRenderer.setProfileSampler(profileSampler, deferredPresentation);
     surfaceRenderer.setSurfaceTopology(surfaceTopology, deferredPresentation);
     surfaceRenderer.setAxisNotation(axisNotation, deferredPresentation);
     snapshotRenderer.setAxisNotation(axisNotation.x, deferredPresentation);
     const physicalBoundaries = physicalBoundaryPositions(problem);
     surfaceRenderer.setBoundaryPositions(physicalBoundaries, deferredPresentation);
     snapshotRenderer.setBoundaryPositions(physicalBoundaries, deferredPresentation);
-    const validatedSolution = { validated: true } as const;
+    const validatedSolution = { validated: true, time: 0 } as const;
     surfaceRenderer.setSolution(result, validatedSolution);
     snapshotRenderer.setSolution(result, validatedSolution);
     renderProblemFormula(problem);
@@ -320,6 +339,22 @@ export function startApp(): void {
 
   function renderCurrentTime(): void {
     if (!currentResult || !acceptedProblem) return;
+    // Resolve the shared profile before either renderer mutates its completed
+    // frame; off-grid singular data must not leave the two plots disagreeing.
+    try {
+      profileSampler?.sample(currentTime);
+      if (selectedX !== null) profileSampler?.valueAt(selectedX, currentTime);
+    } catch (error) {
+      currentTime = Number(root.dataset.currentTime ?? 0);
+      timeSlider.value = String(Math.round(currentTime / acceptedProblem.T * TIME_SLIDER_STEPS));
+      setPlaying(false);
+      const message = error instanceof Error ? error.message : "The selected profile could not be resolved.";
+      interactionStatus.textContent = `${message} Showing the last complete frame.`;
+      sourceStatus.textContent = message;
+      sourceStatus.className = "status-chip is-error";
+      sourceStatus.setAttribute("aria-label", `Problem status: ${message}`);
+      return;
+    }
     surfaceRenderer.setTime(currentTime);
     snapshotRenderer.setTime(currentTime);
     snapshotRenderer.setSelectedX(selectedX);
@@ -348,12 +383,19 @@ export function startApp(): void {
     updateDescriptions();
     if (!firstSurfacePaint) {
       firstSurfacePaint = true;
-      performance.mark("wave:first-surface-painted");
+      performance.mark("wave:first-surface-submitted");
       performance.measure(
-        "wave:first-surface-paint",
+        "wave:first-surface-submission",
         APP_START_MARK,
-        "wave:first-surface-painted"
+        "wave:first-surface-submitted"
       );
+      // A browser paint opportunity after fonts/layout, not a GPU completion claim.
+      void document.fonts?.ready.then(() => {
+        lifetime.frame(() => lifetime.frame(() => {
+          performance.mark("wave:first-presentation-opportunity");
+          root.dataset.firstPresentationMs = String(performance.now());
+        }));
+      });
     }
   }
 
@@ -368,7 +410,7 @@ export function startApp(): void {
         : "");
     const pointValue = selectedX === null
       ? null
-      : sampleSolution(currentResult, selectedX, currentTime);
+      : profileSampler?.valueAt(selectedX, currentTime) ?? null;
     snapshotDescription.textContent =
       `Snapshot of u as a function of x at time ${formatNumber(currentTime)}.` +
       (pointValue === null
@@ -377,16 +419,18 @@ export function startApp(): void {
   }
 
   function setPlaying(next: boolean): void {
+    const wasPlaying = playing;
     playing = Boolean(next && currentResult && acceptedProblem);
     lastAnimationTimestamp = null;
     updatePlaybackUi();
     if (playing) scheduleAnimation();
     else cancelAnimation();
+    if (wasPlaying && !playing && !disposed) scheduleRender();
   }
 
   function scheduleRender(): void {
     if (renderFrame !== 0) return;
-    renderFrame = window.requestAnimationFrame(() => {
+    renderFrame = lifetime.frame(() => {
       renderFrame = 0;
       renderCurrentTime();
     });
@@ -417,12 +461,13 @@ export function startApp(): void {
     const result = currentResult;
     const x = selectedX;
     const time = currentTime;
-    characteristicComputeFrame = window.requestAnimationFrame(() => {
+    characteristicComputeFrame = lifetime.frame(() => {
       characteristicComputeFrame = 0;
       let nextTrace: CharacteristicTrace;
       try {
         const started = performance.now();
         nextTrace = traceCharacteristics(problem, result, x, time);
+        if (profileSampler) nextTrace.point.u = profileSampler.valueAt(x, time);
         root.dataset.traceComputeMs = (performance.now() - started).toFixed(3);
         root.dataset.traceStage = "computed";
       } catch (error) {
@@ -434,7 +479,7 @@ export function startApp(): void {
       }
       if (request !== characteristicRequest || characteristicMode !== "active") return;
 
-      characteristicSurfaceFrame = window.requestAnimationFrame(() => {
+      characteristicSurfaceFrame = lifetime.frame(() => {
         characteristicSurfaceFrame = 0;
         if (request !== characteristicRequest || characteristicMode !== "active") return;
         const started = performance.now();
@@ -446,7 +491,7 @@ export function startApp(): void {
         root.dataset.traceSurfaceMs = prepareMs;
         root.dataset.traceStage = "three-prepared";
 
-        characteristicSurfaceRenderFrame = window.requestAnimationFrame(() => {
+        characteristicSurfaceRenderFrame = lifetime.frame(() => {
           characteristicSurfaceRenderFrame = 0;
           if (request !== characteristicRequest || characteristicMode !== "active") return;
           const started = performance.now();
@@ -457,7 +502,7 @@ export function startApp(): void {
           root.dataset.traceSurfaceRenderMs = webglMs;
           root.dataset.traceStage = "webgl-rendered";
 
-          characteristicLabelRenderFrame = window.requestAnimationFrame(() => {
+          characteristicLabelRenderFrame = lifetime.frame(() => {
             characteristicLabelRenderFrame = 0;
             if (request !== characteristicRequest || characteristicMode !== "active") return;
             const started = performance.now();
@@ -465,7 +510,7 @@ export function startApp(): void {
             root.dataset.traceSurfaceLabelsMs = (performance.now() - started).toFixed(3);
             root.dataset.traceStage = "labels-rendered";
 
-            characteristicFinalizeFrame = window.requestAnimationFrame(() => {
+            characteristicFinalizeFrame = lifetime.frame(() => {
               characteristicFinalizeFrame = 0;
               if (request !== characteristicRequest || characteristicMode !== "active") return;
               const started = performance.now();
@@ -477,11 +522,13 @@ export function startApp(): void {
               lastCharacteristicTime = time;
               root.dataset.characteristics = "active";
               root.dataset.traceStage = "complete";
+              root.dataset.traceTime = String(time);
+              root.dataset.traceCompletedCount = String(Number(root.dataset.traceCompletedCount) + 1);
               if (!characteristicsEntry.hidden) {
                 setCharacteristicEntryFeedback("Characteristics are shown for the selected point.", "ready");
               }
               updateDescriptions();
-              if (Math.abs(currentTime - time) >= problem.T / 120) {
+              if ((!playing && currentTime !== time) || Math.abs(currentTime - time) >= problem.T / 120) {
                 scheduleCharacteristicRefresh();
               }
             });
@@ -500,23 +547,23 @@ export function startApp(): void {
       characteristicFinalizeFrame !== 0;
     characteristicRequest += 1;
     if (characteristicComputeFrame !== 0) {
-      window.cancelAnimationFrame(characteristicComputeFrame);
+      lifetime.cancelFrame(characteristicComputeFrame);
       characteristicComputeFrame = 0;
     }
     if (characteristicSurfaceFrame !== 0) {
-      window.cancelAnimationFrame(characteristicSurfaceFrame);
+      lifetime.cancelFrame(characteristicSurfaceFrame);
       characteristicSurfaceFrame = 0;
     }
     if (characteristicSurfaceRenderFrame !== 0) {
-      window.cancelAnimationFrame(characteristicSurfaceRenderFrame);
+      lifetime.cancelFrame(characteristicSurfaceRenderFrame);
       characteristicSurfaceRenderFrame = 0;
     }
     if (characteristicLabelRenderFrame !== 0) {
-      window.cancelAnimationFrame(characteristicLabelRenderFrame);
+      lifetime.cancelFrame(characteristicLabelRenderFrame);
       characteristicLabelRenderFrame = 0;
     }
     if (characteristicFinalizeFrame !== 0) {
-      window.cancelAnimationFrame(characteristicFinalizeFrame);
+      lifetime.cancelFrame(characteristicFinalizeFrame);
       characteristicFinalizeFrame = 0;
     }
     if (characteristicSurfacePrepared) {
@@ -614,6 +661,7 @@ export function startApp(): void {
     characteristicMode = "active";
     characteristicsButton.setAttribute("aria-pressed", "true");
     if (characteristicsLabel) characteristicsLabel.textContent = "Clear characteristics";
+    characteristicsButton.setAttribute("aria-label", "Clear characteristics");
     setTime(time);
     if (syncEntry) {
       characteristicXInput.value = formatPointInputValue(x, acceptedAxisNotation.x);
@@ -636,12 +684,12 @@ export function startApp(): void {
 
   function scheduleAnimation(): void {
     if (animationFrame !== 0 || !playing || document.hidden) return;
-    animationFrame = window.requestAnimationFrame(animate);
+    animationFrame = lifetime.frame(animate);
   }
 
   function cancelAnimation(): void {
     if (animationFrame !== 0) {
-      window.cancelAnimationFrame(animationFrame);
+      lifetime.cancelFrame(animationFrame);
       animationFrame = 0;
     }
   }
@@ -664,9 +712,7 @@ export function startApp(): void {
     }
     renderCurrentTime();
     if (currentTime >= acceptedProblem.T) {
-      playing = false;
-      lastAnimationTimestamp = null;
-      updatePlaybackUi();
+      setPlaying(false);
       interactionStatus.textContent = "The evolution reached its final time.";
       return;
     }
@@ -675,7 +721,7 @@ export function startApp(): void {
 
   function scheduleDraftCommit(): void {
     cancelDraftCommit();
-    draftTimer = window.setTimeout(() => {
+    draftTimer = lifetime.timeout(() => {
       draftTimer = 0;
       controller.commitDraft();
     }, DRAFT_DEBOUNCE_MS);
@@ -683,7 +729,7 @@ export function startApp(): void {
 
   function cancelDraftCommit(): void {
     if (draftTimer !== 0) {
-      window.clearTimeout(draftTimer);
+      lifetime.cancelTimeout(draftTimer);
       draftTimer = 0;
     }
   }
@@ -713,12 +759,15 @@ export function startApp(): void {
     else if (restoreHadFocus) uiToggle.focus();
   }
 
-  timeSlider.addEventListener("input", () => {
+  lifetime.on(timeSlider, "input", () => {
     if (!acceptedProblem) return;
     setPlaying(false);
     setTime((Number(timeSlider.value) / TIME_SLIDER_STEPS) * acceptedProblem.T);
   });
-  playbackButton.addEventListener("click", () => {
+  lifetime.on(initialProfileToggle, "change", () => {
+    snapshotRenderer.setInitialProfileVisible(initialProfileToggle.checked);
+  });
+  lifetime.on(playbackButton, "click", () => {
     if (!acceptedProblem) return;
     if (currentTime >= acceptedProblem.T) {
       currentTime = 0;
@@ -729,15 +778,15 @@ export function startApp(): void {
     }
     setPlaying(!playing);
   });
-  restartButton.addEventListener("click", () => {
+  lifetime.on(restartButton, "click", () => {
     resetEvolution();
     interactionStatus.textContent = "The evolution restarted at time zero and is paused.";
   });
-  resetCameraButton.addEventListener("click", () => {
+  lifetime.on(resetCameraButton, "click", () => {
     surfaceRenderer.resetCamera();
     interactionStatus.textContent = "The three-dimensional camera was reset.";
   });
-  characteristicsButton.addEventListener("click", () => {
+  lifetime.on(characteristicsButton, "click", () => {
     if (characteristicMode === "off") {
       if (!acceptedProblem || !currentResult) {
         interactionStatus.textContent = "Wait for the accepted solution before selecting characteristics.";
@@ -746,17 +795,20 @@ export function startApp(): void {
       setPlaying(false);
       cancelCharacteristicRefresh();
       characteristicMode = "selecting";
+      snapshotRenderer.setSelectionEnabled(true);
       selectedX = null;
       characteristicTrace = null;
       lastCharacteristicTime = Number.NEGATIVE_INFINITY;
       root.dataset.characteristics = "selecting";
       characteristicsButton.setAttribute("aria-pressed", "true");
       if (characteristicsLabel) characteristicsLabel.textContent = "Cancel characteristics";
+      characteristicsButton.setAttribute("aria-label", "Cancel characteristics");
       openCharacteristicEntry();
       interactionStatus.textContent = "Enter a point, or select one on the snapshot curve with the pointer or arrow keys.";
       return;
     }
     characteristicMode = "off";
+    snapshotRenderer.setSelectionEnabled(false);
     cancelCharacteristicRefresh();
     selectedX = null;
     characteristicTrace = null;
@@ -765,6 +817,7 @@ export function startApp(): void {
     characteristicsButton.setAttribute("aria-pressed", "false");
     closeCharacteristicEntry();
     if (characteristicsLabel) characteristicsLabel.textContent = "Characteristics";
+    characteristicsButton.setAttribute("aria-label", "Characteristics");
     surfaceRenderer.setCharacteristics(null);
     snapshotRenderer.setSelectedX(null);
     snapshotRenderer.setCharacteristics(null);
@@ -772,9 +825,9 @@ export function startApp(): void {
     interactionStatus.textContent = "Characteristics cleared.";
   });
   for (const input of [characteristicXInput, characteristicTInput]) {
-    input.addEventListener("input", () => validateCharacteristicEntry());
+    lifetime.on(input, "input", () => validateCharacteristicEntry());
   }
-  characteristicPointForm.addEventListener("submit", (event) => {
+  lifetime.on(characteristicPointForm, "submit", (event) => {
     event.preventDefault();
     const validation = validateCharacteristicEntry();
     if (!validation || !validation.ok) {
@@ -787,33 +840,39 @@ export function startApp(): void {
     setCharacteristicEntryFeedback("Tracing the entered point.", "ready");
     interactionStatus.textContent = "Tracing characteristics from the entered point.";
   });
-  chooseCharacteristicOnCurve.addEventListener("click", () => {
+  lifetime.on(chooseCharacteristicOnCurve, "click", () => {
     snapshotRenderer.svg.focus();
     setCharacteristicEntryFeedback("Use the pointer or the left and right arrow keys on the curve.", "info");
     interactionStatus.textContent = "Choose a point on the snapshot curve with the pointer or arrow keys.";
   });
-  characteristicPointForm.addEventListener("keydown", (event) => {
+  lifetime.on(characteristicPointForm, "keydown", (event) => {
     if (event.key !== "Escape") return;
     event.preventDefault();
     characteristicsButton.click();
     characteristicsButton.focus();
   });
-  problemToggle.addEventListener("click", () => setProblemOpen(!problemOpen));
-  problemClose.addEventListener("click", () => {
+  lifetime.on(problemToggle, "click", () => setProblemOpen(!problemOpen));
+  lifetime.on(problemClose, "click", () => {
     setProblemOpen(false);
     problemToggle.focus();
   });
-  uiToggle.addEventListener("click", () => setUiHidden(!uiHidden));
-  restoreUi.addEventListener("click", () => setUiHidden(false));
+  lifetime.on(uiToggle, "click", () => setUiHidden(!uiHidden));
+  lifetime.on(restoreUi, "click", () => setUiHidden(false));
 
-  document.addEventListener("visibilitychange", () => {
+  lifetime.on(document, "visibilitychange", () => {
     lastAnimationTimestamp = null;
-    if (document.hidden) cancelAnimation();
-    else if (playing) scheduleAnimation();
+    if (document.hidden) {
+      cancelAnimation();
+      cancelCharacteristicRefresh();
+    } else if (playing) scheduleAnimation();
+    else scheduleRender();
   });
-  window.addEventListener("keydown", (event) => {
-    if (isEditableTarget(event.target)) return;
+  lifetime.on(window, "keydown", (event) => {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.repeat ||
+      isEditableTarget(event.target)) return;
     if (event.key === " ") {
+      if (event.target instanceof Element &&
+        event.target.closest("button, a[href], [role=button], [role=checkbox], [role=switch]")) return;
       event.preventDefault();
       playbackButton.click();
     } else if (event.key.toLowerCase() === "r") {
@@ -824,23 +883,29 @@ export function startApp(): void {
       characteristicsButton.click();
     }
   });
-  window.addEventListener("resize", () => {
+  lifetime.on(window, "resize", () => {
     surfaceRenderer.resize();
     snapshotRenderer.resize();
   });
-  window.addEventListener("beforeunload", () => {
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
     cancelAnimation();
     cancelCharacteristicRefresh();
-    if (renderFrame !== 0) window.cancelAnimationFrame(renderFrame);
+    if (renderFrame !== 0) lifetime.cancelFrame(renderFrame);
     cancelDraftCommit();
     unsubscribe();
+    editor.dispose();
     controller.dispose();
     surfaceRenderer.dispose();
     snapshotRenderer.dispose();
-  });
+    lifetime.dispose();
+  }
+  lifetime.on(window, "beforeunload", dispose);
 
   // Compact screens begin with the large problem form collapsed.
-  setProblemOpen(!window.matchMedia("(max-width: 700px)").matches);
+  setProblemOpen(!window.matchMedia("(max-width: 760px)").matches);
+  return dispose;
 
   function renderProblemFormula(problem: WaveProblem): void {
     renderLatex(
@@ -966,19 +1031,7 @@ function surfaceTopologyForSolution(
   solution: WaveSolutionGrid
 ): SurfaceTopology {
   if (waveProblemMayHaveDiscontinuousDisplacement(problem)) return "stepped";
-  const threshold =
-    (solution.surfaceRange.max - solution.surfaceRange.min) * 0.2;
-  for (let xIndex = 0; xIndex < solution.x.length - 1; xIndex += 1) {
-    if (
-      Math.abs(
-        Number(solution.values[xIndex + 1]) -
-        Number(solution.values[xIndex])
-      ) >= threshold
-    ) {
-      return "stepped";
-    }
-  }
-  return "smooth";
+  return hasSpatialJump(solution) ? "stepped" : "smooth";
 }
 
 function boundaryLatex(

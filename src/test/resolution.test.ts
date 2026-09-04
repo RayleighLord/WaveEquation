@@ -8,7 +8,11 @@ import {
   REFERENCE_TIME_SPACING,
   adaptiveAcceptedSampleCounts,
   adaptiveSurfaceSampleCounts,
+  createWaveProblem,
   getWavePresetProblem,
+  hasSpatialJump,
+  samplingResolutionNotices,
+  solveWaveProblem,
   waveProblemMayHaveDiscontinuousDisplacement,
   type ProductDomainKind,
   type WavePresetId
@@ -30,6 +34,46 @@ const EXPECTED = {
 } as const satisfies Record<WavePresetId, readonly (readonly [number, number])[]>;
 
 describe("adaptive wave-surface resolution", () => {
+  it("plans cut resolution for single-expression and boundary-generated steps", () => {
+    const initial = createWaveProblem({
+      c: 1, T: 2, domain: { kind: "infinite" }, view: { xMin: -2, xMax: 2 },
+      f: [{ id: "f", expression: "sign(x)", lower: "-inf", upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: "-inf", upper: "inf" }], boundaries: {}
+    });
+    const driven = createWaveProblem({
+      c: 1, T: 2, domain: { kind: "right-half-line", left: 0 }, view: { xMin: 0, xMax: 4 },
+      f: [{ id: "f", expression: "0", lower: 0, upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: 0, upper: "inf" }],
+      boundaries: { left: { kind: "dirichlet", expression: "(1 + sign(t - 1)) / 2" } }
+    });
+    for (const problem of [initial, driven]) {
+      expect(waveProblemMayHaveDiscontinuousDisplacement(problem)).toBe(true);
+      expect(adaptiveAcceptedSampleCounts(problem).xSamples).toBe(1025);
+      expect(hasSpatialJump(solveWaveProblem(problem, { xSamples: 33, tSamples: 33 }))).toBe(true);
+    }
+  });
+
+  it("does not misclassify spatially uniform time changes as jumps", () => {
+    const problem = createWaveProblem({
+      c: 1, T: 2, domain: { kind: "infinite" }, view: { xMin: -2, xMax: 2 },
+      f: [{ id: "f", expression: "0", lower: "-inf", upper: "inf" }],
+      g: [{ id: "g", expression: "100", lower: "-inf", upper: "inf" }], boundaries: {}
+    });
+    expect(hasSpatialJump(solveWaveProblem(problem, { xSamples: 17, tSamples: 3 }))).toBe(false);
+  });
+
+  it("warns about narrow shifted displacement without duplicating notices", () => {
+    const problem = createWaveProblem({
+      c: 1, T: 8, domain: { kind: "infinite" }, view: { xMin: -6, xMax: 6 },
+      f: [{ id: "f", expression: "exp(-1000000 * (x - 0.01)^2) + exp(-1000000 * (x + 0.01)^2)", lower: "-inf", upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: "-inf", upper: "inf" }], boundaries: {}
+    });
+    const notices = samplingResolutionNotices(problem, 12 / 512, 0.05);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ code: "sampling-resolution", path: "f" });
+    expect(samplingResolutionNotices(problem, 0.00001, 0.05)).toHaveLength(0);
+  });
+
   it("uses the deterministic source count matrix for all 18 example variants", () => {
     for (const [preset, expectedDomains] of Object.entries(EXPECTED) as Array<
       [WavePresetId, typeof EXPECTED[WavePresetId]]

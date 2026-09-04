@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertReviewRegressions } from "./browser-regressions.mjs";
 
 import {
   artifactDirectory,
@@ -71,6 +72,7 @@ try {
   await assertUiAndResponsiveLayout(page);
   await assertReducedMotionStart(browser, baseUrl);
   await assertWebglFallback(browser, baseUrl);
+  await assertReviewRegressions(browser, baseUrl);
 
   assert.deepEqual(
     browserErrors,
@@ -1582,7 +1584,8 @@ async function assertUiAndResponsiveLayout(page) {
   assert.ok(compact.stageTop > compact.formulaBottom);
   assert.ok(compact.snapshotTop > compact.surfaceBottom);
   assert.ok(compact.viewControlsTop > compact.snapshotBottom);
-  assert.ok(compact.timeTop > compact.viewControlsBottom);
+  assert.ok(compact.timeTop >= compact.surfaceBottom, "Compact playback follows the surface.");
+  assert.ok(compact.timeTop < compact.snapshotTop, "Compact playback stays next to the snapshot.");
   assert.ok(Math.abs(compact.snapshotWidth - compact.stageWidth) < 1);
   assert.ok(Math.abs(compact.snapshotLeft - compact.stageLeft) < 1);
   assert.ok(Math.abs(compact.timeOutputFontSize - 19.2) < 0.05);

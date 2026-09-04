@@ -272,7 +272,8 @@ function validateDomain(
       if (
         !Number.isFinite(value.left) ||
         !Number.isFinite(value.right) ||
-        !(value.left < value.right)
+        !(value.left < value.right) ||
+        !Number.isFinite(value.right - value.left)
       ) {
         errors.push(
           error(
@@ -299,7 +300,8 @@ function validateView(
     !value ||
     !Number.isFinite(value.xMin) ||
     !Number.isFinite(value.xMax) ||
-    !(value.xMin < value.xMax)
+    !(value.xMin < value.xMax) ||
+    !Number.isFinite(value.xMax - value.xMin)
   ) {
     errors.push(
       error(
@@ -580,50 +582,62 @@ function addCompatibilityNotices(
     const boundary = boundaries[side];
     const endpoint = domainBoundary(domain, side);
     if (!boundary || endpoint === undefined) continue;
-    const initialValue = evaluatePiecewise(f, endpoint);
-    const initialVelocity = evaluatePiecewise(g, endpoint);
-    const boundaryValue = evaluateExpression(boundary.ast, { t: 0 });
-    if (boundary.kind === "dirichlet") {
-      if (!closeScaled(initialValue, boundaryValue, CORNER_TOLERANCE)) {
-        errors.push(
-          error(
-            "dirichlet-corner",
-            `At the ${side} corner, f(${formatNumber(endpoint)})=${formatNumber(
-              initialValue
-            )} but the Dirichlet value at t=0 is ${formatNumber(boundaryValue)}.`,
-            `boundaries.${side}`
+    let probePath = "f";
+    try {
+      const initialValue = evaluatePiecewise(f, endpoint);
+      probePath = "g";
+      const initialVelocity = evaluatePiecewise(g, endpoint);
+      probePath = `boundaries.${side}.expression`;
+      const boundaryValue = evaluateExpression(boundary.ast, { t: 0 });
+      if (boundary.kind === "dirichlet") {
+        if (!closeScaled(initialValue, boundaryValue, CORNER_TOLERANCE)) {
+          errors.push(
+            error(
+              "dirichlet-corner",
+              `At the ${side} corner, f(${formatNumber(endpoint)})=${formatNumber(
+                initialValue
+              )} but the Dirichlet value at t=0 is ${formatNumber(boundaryValue)}.`,
+              `boundaries.${side}`
+            )
+          );
+        }
+        const boundaryVelocity = oneSidedTimeDerivative(boundary, T);
+        if (
+          !closeScaled(
+            initialVelocity,
+            boundaryVelocity,
+            COMPATIBILITY_TOLERANCE
           )
-        );
+        ) {
+          warnings.push(
+            warning(
+              "dirichlet-compatibility",
+              `The initial velocity and time derivative of the ${side} Dirichlet data do not match at the corner; a weak solution may contain a wavefront.`,
+              `boundaries.${side}`
+            )
+          );
+        }
+      } else {
+        probePath = "f";
+        const initialSlope = oneSidedSpatialDerivative(f, endpoint, side, domain);
+        if (
+          !closeScaled(initialSlope, boundaryValue, COMPATIBILITY_TOLERANCE)
+        ) {
+          warnings.push(
+            warning(
+              "neumann-compatibility",
+              `The derivative of the initial displacement and the ${side} Neumann data do not match at the corner; a weak solution may contain a wavefront.`,
+              `boundaries.${side}`
+            )
+          );
+        }
       }
-      const boundaryVelocity = oneSidedTimeDerivative(boundary, T);
-      if (
-        !closeScaled(
-          initialVelocity,
-          boundaryVelocity,
-          COMPATIBILITY_TOLERANCE
-        )
-      ) {
-        warnings.push(
-          warning(
-            "dirichlet-compatibility",
-            `The initial velocity and time derivative of the ${side} Dirichlet data do not match at the corner; a weak solution may contain a wavefront.`,
-            `boundaries.${side}`
-          )
-        );
-      }
-    } else {
-      const initialSlope = oneSidedSpatialDerivative(f, endpoint, side, domain);
-      if (
-        !closeScaled(initialSlope, boundaryValue, COMPATIBILITY_TOLERANCE)
-      ) {
-        warnings.push(
-          warning(
-            "neumann-compatibility",
-            `The derivative of the initial displacement and the ${side} Neumann data do not match at the corner; a weak solution may contain a wavefront.`,
-            `boundaries.${side}`
-          )
-        );
-      }
+    } catch (caught) {
+      errors.push(error(
+        "invalid-expression",
+        `The ${side} corner check could not evaluate the data: ${messageOf(caught)}`,
+        probePath
+      ));
     }
   }
 }
@@ -633,8 +647,12 @@ function oneSidedTimeDerivative(
   T: number
 ): number {
   const evaluate = compileExpression(boundary.ast, "t");
-  const step = Math.max(1e-7, Math.min(1e-4, T * 1e-5));
-  return (-3 * evaluate(0) + 4 * evaluate(step) - evaluate(2 * step)) / (2 * step);
+  const step = Math.min(T / 4, Math.max(1e-7, Math.min(1e-4, T * 1e-5)));
+  const values = [evaluate(0), evaluate(step), evaluate(2 * step)];
+  if (!values.every(Number.isFinite)) {
+    throw new Error("Boundary data are not finite near t=0.");
+  }
+  return (-3 * (values[0] as number) + 4 * (values[1] as number) - (values[2] as number)) / (2 * step);
 }
 
 function oneSidedSpatialDerivative(
@@ -647,8 +665,11 @@ function oneSidedSpatialDerivative(
   const scale =
     Number.isFinite(bounds.lower) && Number.isFinite(bounds.upper)
       ? bounds.upper - bounds.lower
-      : Math.max(1, Math.abs(endpoint));
-  const step = Math.max(1e-7, scale * 1e-5);
+      : 1;
+  const step = Math.min(
+    scale / 4,
+    Math.max(scale * 1e-5, 4 * Number.EPSILON * Math.max(scale, Math.abs(endpoint)))
+  );
   if (side === "left") {
     return (
       -3 * evaluatePiecewise(expression, endpoint) +

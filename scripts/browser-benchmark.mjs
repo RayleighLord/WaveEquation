@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   artifactDirectory,
   launchChromium,
+  monitorBrowserErrors,
   prepareArtifacts,
   startPreview,
   stopPreview
@@ -38,40 +39,60 @@ let browser;
 let context;
 let page;
 let benchmarkSignalSequence = 0;
+const browserErrors = [];
 
 try {
   browser = await launchChromium();
-  context = await createInstrumentedContext(browser);
-  page = await context.newPage();
-
   const initialSamples = [];
+  const warmSamples = [];
   for (let run = 0; run < INITIAL_RUNS; run += 1) {
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await waitForAcceptedSolution(page);
-    const sample = await page.evaluate(() => ({
-      solveMs: Number(document.documentElement.dataset.solveMs),
-      firstSurfaceMs: performance.now(),
-      acceptedRevision: Number(document.documentElement.dataset.acceptedRevision),
-      vertices: document.querySelector(".snapshot-curve")?.getAttribute("d")?.length ?? 0
-    }));
-    assertFiniteNonNegative(sample.solveMs, "initial worker solve");
-    assertFiniteNonNegative(sample.firstSurfaceMs, "first surface paint");
-    assert.ok(sample.acceptedRevision > 0);
-    assert.ok(sample.vertices > 20);
-    initialSamples.push(sample);
+    context = await createInstrumentedContext(browser);
+    page = await context.newPage();
+    monitorBrowserErrors(page, browserErrors);
+    for (const samples of [initialSamples, warmSamples]) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await waitForAcceptedSolution(page);
+      await page.waitForFunction(() => Number(document.documentElement.dataset.firstPresentationMs) > 0);
+      const sample = await page.evaluate(() => ({
+        solveMs: Number(document.documentElement.dataset.solveMs),
+        firstSurfaceMs: Number(document.documentElement.dataset.firstPresentationMs),
+        acceptedRevision: Number(document.documentElement.dataset.acceptedRevision),
+        vertices: document.querySelector(".snapshot-curve")?.getAttribute("d")?.length ?? 0
+      }));
+      assertFiniteNonNegative(sample.solveMs, "initial worker solve");
+      assertFiniteNonNegative(sample.firstSurfaceMs, "first presentation opportunity");
+      assert.ok(sample.acceptedRevision > 0);
+      assert.ok(sample.vertices > 20);
+      samples.push(sample);
+    }
+    await context.close();
+    context = undefined;
   }
 
   // Use a fresh browser after cold starts so reload cleanup is not attributed
   // to ordinary interaction work.
-  await context.close();
-  context = undefined;
   await browser.close();
   browser = await launchChromium();
   context = await createInstrumentedContext(browser);
   page = await context.newPage();
+  monitorBrowserErrors(page, browserErrors);
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitForAcceptedSolution(page);
   await waitForStableRendererLayout(page);
+  console.log("Benchmark environment", {
+    browser: browser.version(),
+    ...await page.evaluate(() => {
+      const canvas = document.querySelector(".wave-surface-canvas");
+      const gl = canvas.getContext("webgl2");
+      const extension = gl?.getExtension("WEBGL_debug_renderer_info");
+      return {
+        viewport: `${innerWidth}x${innerHeight}`,
+        devicePixelRatio,
+        renderer: extension ? gl.getParameter(extension.UNMASKED_RENDERER_WEBGL) : "unavailable",
+        samples: [document.documentElement.dataset.solverXSamples, document.documentElement.dataset.solverTSamples]
+      };
+    })
+  });
 
   const slider = page.locator("#time-slider");
   const sliderMaximum = Number(await slider.getAttribute("max"));
@@ -87,12 +108,21 @@ try {
   const timeMeasurement = await measureTimeUpdates(page, values);
   const updateSamples = timeMeasurement.samples;
   const timeLongTasks = await takeLongTasks(page, timeMeasurement.finishedAt);
+  const dragMeasurement = await measurePlaneDrag(page);
+  const dragLongTasks = await takeLongTasks(page, dragMeasurement.finishedAt);
+  const playbackMeasurement = await measurePlayback(page, "smooth");
+  const playbackLongTasks = await takeLongTasks(page, playbackMeasurement.finishedAt);
 
   await openEditor(page);
   const adaptiveMeasurement = await measureScalarCommit(page, "20");
   assert.equal(adaptiveMeasurement.solverXSamples, 513);
   assert.equal(adaptiveMeasurement.solverTSamples, 401);
   const adaptiveLongTasks = await takeLongTasks(page, adaptiveMeasurement.finishedAt);
+  await measureScalarCommit(page, "18", "view-x-max-input");
+  assert.equal(Number(await page.locator("html").getAttribute("data-solver-x-samples")), 1025);
+  const denseMeasurement = await measureTimeUpdates(page, values);
+  const denseLongTasks = await takeLongTasks(page, denseMeasurement.finishedAt);
+  await measureScalarCommit(page, "6", "view-x-max-input");
   await measureScalarCommit(page, "8");
   const presetMeasurement = await measurePresetSelection(page, "standing-wave");
   const presetLongTasks = await takeLongTasks(page, presetMeasurement.finishedAt);
@@ -107,6 +137,10 @@ try {
     page,
     characteristicMeasurement.finishedAt
   );
+  const tracePlaybackMeasurement = await measurePlayback(page, "square with characteristics");
+  assert.ok(tracePlaybackMeasurement.traceCompletions > 0,
+    "Sustained characteristic playback must finish refreshed traces.");
+  const tracePlaybackLongTasks = await takeLongTasks(page, tracePlaybackMeasurement.finishedAt);
 
   if (process.env.BENCHMARK_DEBUG === "1") {
     console.log("Long-task windows", {
@@ -118,6 +152,10 @@ try {
     });
     console.log("Characteristic stages", characteristicMeasurement.stages);
     console.log("Time update samples", updateSamples);
+    console.log("Preset presentation callbacks", await page.evaluate(({ start, end }) => {
+      const callbacks = window.__waveRafDurations.filter(frame => frame.startedAt >= start && frame.startedAt <= end);
+      return { count: callbacks.length, maximum: Math.max(0, ...callbacks.map(frame => frame.duration)) };
+    }, { start: presetMeasurement.finishedAt - presetMeasurement.latencyMs, end: presetMeasurement.finishedAt }));
   }
 
   const solveMedian = median(initialSamples.map(({ solveMs }) => solveMs));
@@ -144,19 +182,28 @@ try {
 
   const report = {
     "worker solve median": solveMedian,
-    "first surface median": firstSurfaceMedian,
+    "cold-context presentation opportunity median": firstSurfaceMedian,
+    "warm navigation presentation opportunity median": median(warmSamples.map(sample => sample.firstSurfaceMs)),
     "animation callback p95": frameP95,
-    "input-to-render p95": latencyP95,
+    "input-to-submission p95": latencyP95,
     "input dispatch p95": dispatchP95,
+    "plane drag callback p95": percentile(dragMeasurement.frameDurations, 0.95),
+    "maximum plane drag long task": maximumDuration(dragLongTasks),
     "maximum time-update long task": maximumTimeLongTask,
     "adaptive T=20 worker solve": adaptiveMeasurement.solveMs,
     "maximum adaptive-resolution long task": maximumAdaptiveLongTask,
     "maximum preset long task": maximumPresetLongTask,
     "maximum stepped-preset long task": maximumSteppedPresetLongTask,
-    "maximum characteristic long task": maximumCharacteristicLongTask
+    "maximum characteristic long task": maximumCharacteristicLongTask,
+    "sustained smooth playback callback p95": percentile(playbackMeasurement.frameDurations, 0.95),
+    "sustained trace playback callback p95": percentile(tracePlaybackMeasurement.frameDurations, 0.95),
+    "maximum sustained playback long task": maximumDuration(playbackLongTasks),
+    "maximum sustained trace long task": maximumDuration(tracePlaybackLongTasks),
+    "maximum density submission p95": percentile(denseMeasurement.samples.map(sample => sample.latencyMs), 0.95),
+    "maximum density long task": maximumDuration(denseLongTasks)
   };
   console.log(
-    `Browser benchmark: ${INITIAL_RUNS} cold starts and ${updateSamples.length} retained time updates.`
+    `Browser benchmark: ${INITIAL_RUNS} fresh-context and warm navigations, ${updateSamples.length} retained time updates.`
   );
   console.table(
     Object.fromEntries(
@@ -167,6 +214,8 @@ try {
     )
   );
 
+  assert.deepEqual(browserErrors, [], `Unexpected browser errors:\n${browserErrors.join("\n")}`);
+  for (const [name, value] of Object.entries(report)) assertFiniteNonNegative(value, name);
   const targetMisses = [];
   if (solveMedian >= TARGET_SOLVE_MS) {
     targetMisses.push(
@@ -183,6 +232,10 @@ try {
       `animation callback p95 ${frameP95.toFixed(3)} ms >= ${TARGET_FRAME_MS} ms`
     );
   }
+  for (const [label, measurement] of [["plane drag", dragMeasurement], ["sustained playback", playbackMeasurement], ["sustained trace playback", tracePlaybackMeasurement]]) {
+    const duration = percentile(measurement.frameDurations, 0.95);
+    if (duration >= TARGET_FRAME_MS) targetMisses.push(`${label} callback p95 ${duration.toFixed(3)} ms >= ${TARGET_FRAME_MS} ms`);
+  }
   if (adaptiveMeasurement.solveMs >= TARGET_SOLVE_MS) {
     targetMisses.push(
       `adaptive T=20 worker solve ${adaptiveMeasurement.solveMs.toFixed(3)} ms >= ` +
@@ -194,7 +247,11 @@ try {
     ["adaptive resolution", maximumAdaptiveLongTask],
     ["preset selection", maximumPresetLongTask],
     ["stepped preset selection", maximumSteppedPresetLongTask],
-    ["characteristic selection", maximumCharacteristicLongTask]
+    ["characteristic selection", maximumCharacteristicLongTask],
+    ["sustained playback", maximumDuration(playbackLongTasks)],
+    ["sustained trace playback", maximumDuration(tracePlaybackLongTasks)],
+    ["maximum density", maximumDuration(denseLongTasks)],
+    ["plane drag", maximumDuration(dragLongTasks)]
   ]) {
     if (duration >= TARGET_LONG_TASK_MS) {
       targetMisses.push(
@@ -360,13 +417,16 @@ async function measurePresetSelection(page, preset) {
         observer = new MutationObserver(() => {
           if (Number(root.dataset.acceptedRevision) <= previousRevision) return;
           observer?.disconnect();
-          window.__wavePresetBenchmark = {
-            latencyMs: performance.now() - startedAt,
-            finishedAt: performance.now(),
-            revision: Number(root.dataset.acceptedRevision)
-          };
-          delete window.__waveCancelBenchmark;
-          window.setTimeout(() => console.debug(signal), 0);
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (cancelled) return;
+            window.__wavePresetBenchmark = {
+              latencyMs: performance.now() - startedAt,
+              finishedAt: performance.now(),
+              revision: Number(root.dataset.acceptedRevision)
+            };
+            delete window.__waveCancelBenchmark;
+            window.setTimeout(() => console.debug(signal), 0);
+          }));
         });
         observer.observe(root, {
           attributes: true,
@@ -383,12 +443,12 @@ async function measurePresetSelection(page, preset) {
   return measurement;
 }
 
-async function measureScalarCommit(page, source) {
-  const signal = nextBenchmarkSignal(`scalar-${source}`);
+async function measureScalarCommit(page, source, fieldId = "final-time-input") {
+  const signal = nextBenchmarkSignal(`scalar-${fieldId}-${source}`);
   const completion = waitForBenchmarkSignal(page, signal, `Scalar benchmark for T=${source}`);
-  const start = page.evaluate(({ nextSource, signal }) => {
+  const start = page.evaluate(({ nextSource, signal, fieldId }) => {
     window.__waveScalarBenchmark = null;
-    const input = document.querySelector("#final-time-input");
+    const input = document.getElementById(fieldId);
     if (!(input instanceof HTMLInputElement)) {
       throw new Error("#final-time-input must be an input element.");
     }
@@ -407,15 +467,18 @@ async function measureScalarCommit(page, source) {
       observer = new MutationObserver(() => {
         if (Number(root.dataset.acceptedRevision) <= previousRevision) return;
         observer?.disconnect();
-        window.__waveScalarBenchmark = {
-          latencyMs: performance.now() - startedAt,
-          finishedAt: performance.now(),
-          solveMs: Number(root.dataset.solveMs),
-          solverXSamples: Number(root.dataset.solverXSamples),
-          solverTSamples: Number(root.dataset.solverTSamples)
-        };
-        delete window.__waveCancelBenchmark;
-        window.setTimeout(() => console.debug(signal), 0);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (cancelled) return;
+          window.__waveScalarBenchmark = {
+            latencyMs: performance.now() - startedAt,
+            finishedAt: performance.now(),
+            solveMs: Number(root.dataset.solveMs),
+            solverXSamples: Number(root.dataset.solverXSamples),
+            solverTSamples: Number(root.dataset.solverTSamples)
+          };
+          delete window.__waveCancelBenchmark;
+          window.setTimeout(() => console.debug(signal), 0);
+        }));
       });
       observer.observe(root, {
         attributes: true,
@@ -424,7 +487,7 @@ async function measureScalarCommit(page, source) {
       input.value = nextSource;
       input.dispatchEvent(new Event("input", { bubbles: true }));
     }, 0);
-  }, { nextSource: source, signal });
+  }, { nextSource: source, signal, fieldId });
   await Promise.all([completion, start]);
   const measurement = await page.evaluate(() => window.__waveScalarBenchmark);
   assert.ok(measurement, `Scalar benchmark did not finish for T=${source}.`);
@@ -501,6 +564,112 @@ async function measureCharacteristicSelection(page) {
   return measurement;
 }
 
+async function measurePlaneDrag(page) {
+  const host = page.locator("#surface-plot");
+  const box = await host.boundingBox();
+  const grab = await host.evaluate(element => ({ x: Number(element.dataset.timePlaneGrabX), y: Number(element.dataset.timePlaneGrabY) }));
+  assert.ok(box && Number.isFinite(grab.x) && Number.isFinite(grab.y));
+  await page.mouse.move(box.x + grab.x, box.y + grab.y);
+  const signal = nextBenchmarkSignal("plane-drag");
+  await page.evaluate(signal => {
+    const controller = new AbortController();
+    let started = false;
+    let cancelled = false;
+    let frameStart = 0;
+    let firstTime = 0;
+    let firstWebgl = 0;
+    let pointerMoves = 0;
+    const root = document.documentElement;
+    const host = document.querySelector("#surface-plot");
+    window.__waveCancelBenchmark = () => { cancelled = true; controller.abort(); };
+    window.addEventListener("pointerdown", () => {
+      started = true;
+      window.__waveResetLongTasks?.();
+      frameStart = window.__waveRafDurations.length;
+      firstTime = Number(root.dataset.currentTime);
+      firstWebgl = Number(host.dataset.webglFrames);
+    }, { once: true, capture: true, signal: controller.signal });
+    window.addEventListener("pointermove", () => { if (started) pointerMoves++; }, { signal: controller.signal });
+    window.addEventListener("pointerup", () => {
+      if (!started) return;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (cancelled) return;
+        window.__waveDragBenchmark = {
+          finishedAt: performance.now(),
+          timeDelta: Number(root.dataset.currentTime) - firstTime,
+          webglFrames: Number(host.dataset.webglFrames) - firstWebgl,
+          pointerMoves,
+          frameDurations: window.__waveRafDurations.slice(frameStart).map(frame => frame.duration)
+        };
+        controller.abort();
+        delete window.__waveCancelBenchmark;
+        window.setTimeout(() => console.debug(signal), 0);
+      }));
+    }, { once: true, signal: controller.signal });
+  }, signal);
+  const completion = waitForBenchmarkSignal(page, signal, "Native plane drag");
+  await page.mouse.down();
+  await page.mouse.move(box.x + grab.x + 110, box.y + grab.y - 45, { steps: 40 });
+  await page.mouse.up();
+  await completion;
+  const result = await page.evaluate(() => window.__waveDragBenchmark);
+  assert.ok(result.timeDelta !== 0 && result.webglFrames > 0 && result.pointerMoves > 0,
+    "Plane dragging must update the actual WebGL time plane.");
+  assert.ok(result.webglFrames <= result.pointerMoves + 2, "Dragging should not duplicate WebGL submissions.");
+  assert.ok(result.frameDurations.length > 0);
+  result.frameDurations.forEach(value => assertFiniteNonNegative(value, "plane drag callback"));
+  return result;
+}
+
+async function measurePlayback(page, label) {
+  const signal = nextBenchmarkSignal(`playback-${label}`);
+  const completion = waitForBenchmarkSignal(page, signal, `Playback ${label}`);
+  const start = page.evaluate(({ signal }) => {
+    let timer;
+    let cancelled = false;
+    const root = document.documentElement;
+    const button = document.querySelector("#playback-button");
+    window.__waveCancelBenchmark = () => {
+      cancelled = true;
+      clearTimeout(timer);
+      if (root.dataset.playback === "playing") button.click();
+    };
+    window.setTimeout(() => {
+      if (cancelled) return;
+      window.__waveResetLongTasks?.();
+      const startedAt = performance.now();
+      const initialFrame = Number(root.dataset.frameSample);
+      const initialTime = Number(root.dataset.currentTime);
+      const frameStart = window.__waveRafDurations.length;
+      const initialCompletions = Number(root.dataset.traceCompletedCount);
+      button.click();
+      timer = window.setTimeout(() => {
+        if (cancelled) return;
+        if (root.dataset.playback === "playing") button.click();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (cancelled) return;
+          window.__wavePlaybackBenchmark = {
+            startedAt,
+            finishedAt: performance.now(),
+            frames: Number(root.dataset.frameSample) - initialFrame,
+            timeDelta: Number(root.dataset.currentTime) - initialTime,
+            traceCompletions: Number(root.dataset.traceCompletedCount) - initialCompletions,
+            frameDurations: window.__waveRafDurations.slice(frameStart).map(frame => frame.duration)
+          };
+          delete window.__waveCancelBenchmark;
+          window.setTimeout(() => console.debug(signal), 0);
+        }));
+      }, 1600);
+    }, 0);
+  }, { signal });
+  await Promise.all([completion, start]);
+  const result = await page.evaluate(() => window.__wavePlaybackBenchmark);
+  assert.ok(result.frames > 5 && result.timeDelta > 0, `${label} must actually advance playback.`);
+  assert.ok(result.frameDurations.length > 5);
+  result.frameDurations.forEach(value => assertFiniteNonNegative(value, `${label} callback`));
+  return result;
+}
+
 async function createInstrumentedContext(browser) {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
@@ -571,6 +740,9 @@ async function waitForAcceptedSolution(page) {
     undefined,
     { timeout: 15_000 }
   );
+  assert.equal(await page.locator("html").getAttribute("data-webgl"), "true",
+    "The 3D benchmark requires WebGL; SVG fallback is tested separately.");
+  assert.equal(await page.locator(".wave-surface-canvas").count(), 1);
 }
 
 async function waitForStableRendererLayout(page) {

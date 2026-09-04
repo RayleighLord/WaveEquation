@@ -7,7 +7,8 @@ import type {
   ScalarDraftField,
   WaveAppViewModel
 } from "./controller";
-import type { WavePresetId } from "../math";
+import { getWavePresetObservation, type WavePresetId } from "../math";
+import type { ProblemNotice } from "../types";
 import { renderLatex } from "../plot/latex";
 
 interface PieceRow {
@@ -38,6 +39,11 @@ export interface ProblemEditorCallbacks {
 
 /** Retained editor for the two piecewise initial-data functions. */
 export class ProblemEditor {
+  private readonly eventController = new AbortController();
+  private readonly fieldFeedback = new Map<HTMLInputElement | HTMLSelectElement, HTMLElement>();
+  private nextFeedbackId = 0;
+  private readonly observation = getElement<HTMLElement>("example-observation");
+  private readonly retainedNotice = getElement<HTMLElement>("accepted-problem-notice");
   private readonly rows: Record<PieceSource, Map<string, PieceRow>> = {
     f: new Map(),
     g: new Map()
@@ -69,7 +75,7 @@ export class ProblemEditor {
     // editor owns these lists once JavaScript starts.
     this.containers.f.replaceChildren();
     this.containers.g.replaceChildren();
-    this.preset.addEventListener("change", () => {
+    this.listen(this.preset, "change", () => {
       callbacks.onPreset(this.preset.value as WavePresetId | "custom");
     });
     this.bindInput(this.domain, "domainKind");
@@ -79,10 +85,10 @@ export class ProblemEditor {
     this.bindInput(this.domainLeft, "domainLeft");
     this.bindInput(this.domainRight, "domainRight");
 
-    getElement<HTMLButtonElement>("add-displacement-piece").addEventListener("click", () =>
+    this.listen(getElement<HTMLButtonElement>("add-displacement-piece"), "click", () =>
       callbacks.onPieceAdd("f")
     );
-    getElement<HTMLButtonElement>("add-velocity-piece").addEventListener("click", () =>
+    this.listen(getElement<HTMLButtonElement>("add-velocity-piece"), "click", () =>
       callbacks.onPieceAdd("g")
     );
     this.bindBoundary(this.leftType, "left", "kind");
@@ -119,16 +125,113 @@ export class ProblemEditor {
     this.domainLeftField.inert = !showLeft;
     this.domainRightField.hidden = !showRight;
     this.domainRightField.inert = !showRight;
+    getElement<HTMLButtonElement>("add-displacement-piece").disabled = draft.f.length >= 16;
+    getElement<HTMLButtonElement>("add-velocity-piece").disabled = draft.g.length >= 16;
+    this.renderErrors(viewModel.errors, draft);
+    const observation = viewModel.presetId === "custom"
+      ? ""
+      : getWavePresetObservation(viewModel.presetId, draft.domainKind);
+    if (this.observation.textContent !== observation) this.observation.textContent = observation;
+    this.observation.hidden = observation.length === 0;
+    this.retainedNotice.hidden = !viewModel.acceptedProblem ||
+      (viewModel.status !== "invalid" && viewModel.status !== "error");
   }
 
   focusLast(source: PieceSource): void {
     Array.from(this.rows[source].values()).at(-1)?.expression.focus();
   }
 
+  focusFirstError(): void {
+    getElement<HTMLElement>("problem-form")
+      .querySelector<HTMLInputElement | HTMLSelectElement>('[aria-invalid="true"]')?.focus();
+  }
+
+  dispose(): void {
+    this.eventController.abort();
+    this.fieldFeedback.clear();
+    this.rows.f.clear();
+    this.rows.g.clear();
+  }
+
+  private listen(element: HTMLElement, event: string, listener: () => void): void {
+    element.addEventListener(event, listener, { signal: this.eventController.signal });
+  }
+
+  private renderErrors(errors: readonly ProblemNotice[], draft: WaveAppViewModel["draft"]): void {
+    const messages = new Map<HTMLInputElement | HTMLSelectElement, string[]>();
+    const link = (input: HTMLInputElement | HTMLSelectElement, message: string): void => {
+      const existing = messages.get(input) ?? [];
+      if (!existing.includes(message)) existing.push(message);
+      messages.set(input, existing);
+    };
+    for (const error of errors) {
+      const path = error.path ?? "";
+      const scalarFields: Record<string, (HTMLInputElement | HTMLSelectElement)[]> = {
+        T: [this.T], "view.xMin": [this.xMin], "view.xMax": [this.xMax],
+        view: [this.xMin, this.xMax], "domain.left": [this.domainLeft],
+        "domain.right": [this.domainRight], "domain.kind": [this.domain],
+        domain: draft.domainKind === "finite" ? [this.domainLeft, this.domainRight] : [this.domain]
+      };
+      for (const input of scalarFields[path] ?? []) link(input, error.message);
+      const boundary = /^boundaries\.(left|right)(?:\.(kind|expression))?$/.exec(path);
+      if (boundary) {
+        const input = boundary[1] === "left"
+          ? boundary[2] === "kind" ? this.leftType : this.leftExpression
+          : boundary[2] === "kind" ? this.rightType : this.rightExpression;
+        link(input, error.message);
+      }
+      const piecePath = /^(f|g)(?:\[(\d+)\])?(?:\.(expression|lower|upper|bounds))?$/.exec(path);
+      if (!piecePath) continue;
+      const source = piecePath[1] as PieceSource;
+      const index = piecePath[2] === undefined ? null : Number(piecePath[2]);
+      draft[source].forEach((piece, pieceIndex) => {
+        if (index !== null && index !== pieceIndex) return;
+        const row = this.rows[source].get(piece.id);
+        if (!row) return;
+        const field = piecePath[3];
+        const inputs = field === "expression" ? [row.expression]
+          : field === "lower" ? [row.lower]
+            : field === "upper" ? [row.upper] : [row.lower, row.upper];
+        inputs.forEach((input) => link(input, error.message));
+      });
+    }
+    for (const [input, feedback] of this.fieldFeedback) {
+      if (!input.isConnected) {
+        this.fieldFeedback.delete(input);
+        continue;
+      }
+      if (!messages.has(input)) {
+        input.removeAttribute("aria-invalid");
+        const descriptions = (input.getAttribute("aria-describedby") ?? "")
+          .split(/\s+/).filter((id) => id && id !== feedback.id);
+        if (descriptions.length) input.setAttribute("aria-describedby", descriptions.join(" "));
+        else input.removeAttribute("aria-describedby");
+        feedback.hidden = true;
+      }
+    }
+    for (const [input, message] of messages) {
+      let feedback = this.fieldFeedback.get(input);
+      if (!feedback) {
+        feedback = document.createElement("span");
+        feedback.id = `problem-field-error-${this.nextFeedbackId++}`;
+        feedback.className = "field-error";
+        input.parentElement?.append(feedback);
+        this.fieldFeedback.set(input, feedback);
+      }
+      const text = message.join(" ");
+      if (feedback.textContent !== text) feedback.textContent = text;
+      feedback.hidden = false;
+      input.setAttribute("aria-invalid", "true");
+      const descriptions = new Set((input.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean));
+      descriptions.add(feedback.id);
+      input.setAttribute("aria-describedby", [...descriptions].join(" "));
+    }
+  }
+
   private bindInput(element: HTMLInputElement | HTMLSelectElement, field: ScalarDraftField): void {
-    element.addEventListener("input", () => this.callbacks.onScalar(field, element.value));
+    this.listen(element, "input", () => this.callbacks.onScalar(field, element.value));
     if (element instanceof HTMLSelectElement) {
-      element.addEventListener("change", () => this.callbacks.onScalar(field, element.value));
+      this.listen(element, "change", () => this.callbacks.onScalar(field, element.value));
     }
   }
 
@@ -138,7 +241,7 @@ export class ProblemEditor {
     field: BoundaryDraftField
   ): void {
     const event = element instanceof HTMLSelectElement ? "change" : "input";
-    element.addEventListener(event, () => this.callbacks.onBoundary(side, field, element.value));
+    this.listen(element, event, () => this.callbacks.onBoundary(side, field, element.value));
   }
 
   private renderBoundarySymbol(
@@ -181,6 +284,10 @@ export class ProblemEditor {
       this.sync(row.expression, piece.expression);
       this.sync(row.lower, piece.lower);
       this.sync(row.upper, piece.upper);
+      const name = source === "f" ? "Initial displacement" : "Initial velocity";
+      row.expression.setAttribute("aria-label", `${name} expression, interval ${index + 1}`);
+      row.lower.setAttribute("aria-label", `${name} interval ${index + 1} lower bound`);
+      row.upper.setAttribute("aria-label", `${name} interval ${index + 1} upper bound`);
       row.remove.disabled = pieces.length <= 1;
       row.remove.setAttribute(
         "aria-label",
@@ -199,6 +306,7 @@ export class ProblemEditor {
       `${source === "f" ? "Initial displacement" : "Initial velocity"} expression`,
       piece.expression
     );
+    expression.setAttribute("aria-describedby", `${source === "f" ? "displacement" : "velocity"}-syntax-hint`);
     const lower = createInput("piece-lower", "Interval lower bound", piece.lower);
     const upper = createInput("piece-upper", "Interval upper bound", piece.upper);
     const remove = document.createElement("button");
@@ -211,16 +319,23 @@ export class ProblemEditor {
       wrapInput(upper, "To"),
       remove
     );
+    expression.parentElement?.classList.add("piece-field--expression");
     for (const [field, input] of [
       ["expression", expression],
       ["lower", lower],
       ["upper", upper]
     ] as const) {
-      input.addEventListener("input", () =>
+      this.listen(input, "input", () =>
         this.callbacks.onPieceInput(source, piece.id, field, input.value)
       );
     }
-    remove.addEventListener("click", () => this.callbacks.onPieceRemove(source, piece.id));
+    this.listen(remove, "click", () => {
+      const ids = [...this.rows[source].keys()];
+      const index = ids.indexOf(piece.id);
+      const neighbor = ids[index + 1] ?? ids[index - 1];
+      this.callbacks.onPieceRemove(source, piece.id);
+      if (neighbor) this.rows[source].get(neighbor)?.expression.focus();
+    });
     return { row, expression, lower, upper, remove };
   }
 
@@ -257,7 +372,8 @@ function wrapInput(input: HTMLInputElement, labelText: string): HTMLLabelElement
   label.className = "piece-field";
   const caption = document.createElement("span");
   caption.className = "mobile-field-label";
-  caption.textContent = labelText;
+  if (labelText === "f(x)" || labelText === "g(x)") renderLatex(caption, labelText);
+  else caption.textContent = labelText;
   label.append(caption, input);
   return label;
 }

@@ -219,6 +219,7 @@ describe("WaveAppController preset domains", () => {
       expect(state.draft[field]).toBe("x + 1");
       expect(state.status).toBe("invalid");
       expect(state.statusMessage).toContain("finite constant expression");
+      expect(state.errors[0]?.path).toBe(field === "T" ? "T" : `view.${field}`);
       expect(worker.requests).toHaveLength(acceptedRequestCount);
       controller.dispose();
     }
@@ -304,8 +305,68 @@ describe("WaveAppController preset domains", () => {
       expect(state.draft.domainLeft).toBe(expression);
       expect(state.status).toBe("invalid");
       expect(state.statusMessage).toContain("finite constant expression");
+      expect(state.errors[0]?.path).toBe("domain.left");
       expect(worker.requests).toHaveLength(acceptedRequestCount);
       controller.dispose();
     }
   );
+
+  it.each(["", "1/", "x"])("reports an incomplete Add interval bound %j without losing the accepted plot", (bound) => {
+    const worker = new FakeWorker();
+    const controller = new WaveAppController(() => worker as unknown as Worker);
+    const request = worker.requests[0]!;
+    worker.emit({ type: "result", result: solveWaveProblem(request.problem, request) });
+    const accepted = controller.getViewModel().result;
+    expect(accepted).not.toBeNull();
+    const id = controller.getViewModel().draft.f[0]!.id;
+    controller.setPieceField("f", id, "lower", bound);
+    const draft = controller.getViewModel().draft;
+    expect(controller.addPiece("f")).toBe(false);
+    expect(controller.getViewModel()).toMatchObject({
+      status: "invalid", draft,
+      errors: [{ path: "f[0].lower", severity: "error" }]
+    });
+    expect(controller.getViewModel().result).toBe(accepted);
+    expect(worker.requests).toHaveLength(1);
+    controller.dispose();
+  });
+
+  it("upgrades a discovered later-row front before publishing an accepted solution", () => {
+    const worker = new FakeWorker();
+    const controller = new WaveAppController(() => worker as unknown as Worker);
+    controller.selectPreset("boundary-driven");
+    controller.setScalarField("T", "2");
+    controller.setScalarField("xMax", "4");
+    // No sign/floor AST hint: the complete-grid check discovers this steep front.
+    controller.setBoundaryField("left", "expression", "min(1, max(0, 100000 * (t - 1)))");
+    expect(controller.commitDraft()).toBe(true);
+    const coarseRequest = worker.requests.at(-1)!;
+    expect(coarseRequest).toMatchObject({ xSamples: 513, tSamples: 81 });
+    const coarse = solveWaveProblem(coarseRequest.problem, coarseRequest);
+    worker.emit({ type: "result", result: coarse });
+    expect(controller.getViewModel()).toMatchObject({ status: "solving", result: null });
+    const refinedRequest = worker.requests.at(-1)!;
+    expect(refinedRequest.revision).toBe(coarseRequest.revision + 1);
+    expect(refinedRequest).toMatchObject({ xSamples: 1025, tSamples: 257 });
+    const refined = solveWaveProblem(refinedRequest.problem, refinedRequest);
+    worker.emit({ type: "result", result: refined });
+    expect(controller.getViewModel()).toMatchObject({ status: "ready", pendingRevision: null });
+    expect(controller.getViewModel().result).toBe(refined);
+    controller.dispose();
+  });
+
+  it("rejects a refined result after the draft changes", () => {
+    const worker = new FakeWorker();
+    const controller = new WaveAppController(() => worker as unknown as Worker);
+    controller.setPieceField("f", controller.getViewModel().draft.f[0]!.id, "expression", "atan(10000 * x)");
+    controller.commitDraft();
+    const coarse = worker.requests.at(-1)!;
+    worker.emit({ type: "result", result: solveWaveProblem(coarse.problem, coarse) });
+    const refined = worker.requests.at(-1)!;
+    expect(refined.revision).toBe(coarse.revision + 1);
+    controller.setScalarField("T", "1/");
+    worker.emit({ type: "result", result: solveWaveProblem(refined.problem, refined) });
+    expect(controller.getViewModel()).toMatchObject({ status: "editing", result: null, pendingRevision: null });
+    controller.dispose();
+  });
 });

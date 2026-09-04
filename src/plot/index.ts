@@ -13,6 +13,11 @@ export {
   type TimeInteractionTrigger
 } from "./SpaceTimeRenderer";
 export {
+  createProfileSampler,
+  type ProfileSampler,
+  type SampledProfile
+} from "./profile";
+export {
   bracket,
   clampGridTime,
   nearestGridIndex,

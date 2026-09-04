@@ -1,31 +1,37 @@
 import type {
-  ExpressionNode,
   ExpressionPiece,
   PiecewiseExpression
 } from "../types";
 import { compileExpression } from "./expression";
+import { expressionIntegrationBreakpoints, expressionIsZero } from "./features";
 
 export interface QuadratureOptions {
   absoluteTolerance?: number;
   relativeTolerance?: number;
   maximumDepth?: number;
+  /** Known feature locations; these partition the integral before refinement. */
+  breakpoints?: readonly number[];
 }
+
+type QuadratureTolerances = Required<Omit<QuadratureOptions, "breakpoints">>;
 
 interface CompiledPiece {
   piece: ExpressionPiece;
   evaluate: (x: number) => number;
+  breakpoints: readonly number[];
 }
 
 const DEFAULT_ABSOLUTE_TOLERANCE = 1e-9;
 const DEFAULT_RELATIVE_TOLERANCE = 1e-8;
 const DEFAULT_MAXIMUM_DEPTH = 16;
 const PRECOMPUTE_SINGLE_PANEL_MAX_WIDTH = 0.01;
+const MAX_LAZY_CACHE_ENTRIES = 4096;
 
 /** Cached, piece-aware numerical antiderivative used by the d'Alembert solver. */
 export class PiecewiseAntiderivative {
   private readonly pieces: CompiledPiece[];
   private readonly cache = new Map<number, number>();
-  private readonly options: Required<QuadratureOptions>;
+  private readonly options: QuadratureTolerances;
   private readonly identicallyZero: boolean;
   private preparedCoordinates = new Float64Array(0);
   private preparedValues = new Float64Array(0);
@@ -41,7 +47,8 @@ export class PiecewiseAntiderivative {
     }
     this.pieces = expression.pieces.map((piece) => ({
       piece,
-      evaluate: compileExpression(piece.ast, "x")
+      evaluate: compileExpression(piece.ast, "x"),
+      breakpoints: expressionIntegrationBreakpoints(piece.ast)
     }));
     this.options = {
       absoluteTolerance:
@@ -51,7 +58,7 @@ export class PiecewiseAntiderivative {
       maximumDepth: options.maximumDepth ?? DEFAULT_MAXIMUM_DEPTH
     };
     this.identicallyZero = expression.pieces.every((piece) =>
-      isLiteralZero(piece.ast)
+      expressionIsZero(piece.ast)
     );
     this.cache.set(anchor, 0);
   }
@@ -62,6 +69,7 @@ export class PiecewiseAntiderivative {
    * anchor-to-coordinate quadrature per grid value.
    */
   precompute(coordinates: Iterable<number>): void {
+    if (this.identicallyZero) return;
     const ordered = [this.anchor];
     for (const coordinate of coordinates) {
       if (!Number.isFinite(coordinate)) {
@@ -73,12 +81,9 @@ export class PiecewiseAntiderivative {
     const unique = ordered.filter(
       (value, index) => index === 0 || value !== ordered[index - 1]
     );
-    if (this.identicallyZero) {
-      this.preparedCoordinates = new Float64Array(0);
-      this.preparedValues = new Float64Array(0);
-      return;
-    }
     this.preparedCoordinates = Float64Array.from(unique);
+    this.cache.clear();
+    this.cache.set(this.anchor, 0);
     const started = now();
     const anchorIndex = unique.indexOf(this.anchor);
     const values = new Float64Array(unique.length);
@@ -139,6 +144,9 @@ export class PiecewiseAntiderivative {
       this.options
     );
     this.elapsed += now() - started;
+    if (this.cache.size >= MAX_LAZY_CACHE_ENTRIES) {
+      this.cache.delete(this.cache.keys().next().value as number);
+    }
     this.cache.set(x, value);
     return value;
   }
@@ -150,11 +158,6 @@ export class PiecewiseAntiderivative {
   get elapsedMs(): number {
     return this.elapsed;
   }
-}
-
-function isLiteralZero(ast: ExpressionNode): boolean {
-  if (ast.type === "number") return ast.value === 0;
-  return ast.type === "unary" && isLiteralZero(ast.argument);
 }
 
 function preparedCoordinateIndex(
@@ -186,7 +189,8 @@ export function integratePiecewise(
 ): number {
   const compiled = expression.pieces.map((piece) => ({
     piece,
-    evaluate: compileExpression(piece.ast, "x")
+    evaluate: compileExpression(piece.ast, "x"),
+    breakpoints: expressionIntegrationBreakpoints(piece.ast)
   }));
   return integrateCompiledPiecewise(compiled, from, to, {
     absoluteTolerance:
@@ -217,19 +221,19 @@ export function integrateFunction(
     }
     return result;
   };
-  return direction * integrateFiniteSegment(checked, lower, upper, {
+  return direction * integratePartitioned(checked, lower, upper, {
     absoluteTolerance:
       options.absoluteTolerance ?? DEFAULT_ABSOLUTE_TOLERANCE,
     relativeTolerance: options.relativeTolerance ?? DEFAULT_RELATIVE_TOLERANCE,
     maximumDepth: options.maximumDepth ?? DEFAULT_MAXIMUM_DEPTH
-  });
+  }, options.breakpoints ?? []);
 }
 
 function integrateCompiledPiecewise(
   pieces: readonly CompiledPiece[],
   from: number,
   to: number,
-  options: Required<QuadratureOptions>,
+  options: QuadratureTolerances,
   initialPanelCount = 8
 ): number {
   if (!Number.isFinite(from) || !Number.isFinite(to)) {
@@ -244,15 +248,41 @@ function integrateCompiledPiecewise(
     const segmentLower = Math.max(lower, compiled.piece.lower);
     const segmentUpper = Math.min(upper, compiled.piece.upper);
     if (!(segmentLower < segmentUpper)) continue;
-    total += integrateFiniteSegment(
+    total += integratePartitioned(
       checkedEvaluator(compiled),
       segmentLower,
       segmentUpper,
       options,
+      compiled.breakpoints,
       initialPanelCount
     );
   }
   return direction * total;
+}
+
+function integratePartitioned(
+  evaluate: (x: number) => number,
+  lower: number,
+  upper: number,
+  options: QuadratureTolerances,
+  breakpoints: readonly number[],
+  initialPanelCount = 8
+): number {
+  let from = lower;
+  let total = 0;
+  for (const point of breakpoints) {
+    if (point <= from || point >= upper) continue;
+    total += integrateFiniteSegment(interiorEvaluator(evaluate, from, point), from, point, options, initialPanelCount);
+    from = point;
+  }
+  return total + integrateFiniteSegment(interiorEvaluator(evaluate, from, upper), from, upper, options, initialPanelCount);
+}
+
+/** The value assigned at an isolated jump must not change its integral. */
+function interiorEvaluator(evaluate: (x: number) => number, lower: number, upper: number): (x: number) => number {
+  const inset = Math.min((upper - lower) / 4,
+    4 * Number.EPSILON * Math.max(Math.abs(lower), Math.abs(upper)));
+  return (x) => evaluate(x === lower ? lower + inset : x === upper ? upper - inset : x);
 }
 
 function checkedEvaluator(compiled: CompiledPiece): (x: number) => number {
@@ -271,7 +301,7 @@ function integrateFiniteSegment(
   evaluate: (x: number) => number,
   lower: number,
   upper: number,
-  options: Required<QuadratureOptions>,
+  options: QuadratureTolerances,
   initialPanelCount = 8
 ): number {
   if (initialPanelCount === 1) {
@@ -289,10 +319,10 @@ function integrateFiniteSegment(
     const coarse = ((upper - lower) / 2) * (leftValue + rightValue);
     const tolerance = options.absoluteTolerance +
       options.relativeTolerance * Math.abs(refined);
-    // Trapezoid-versus-Simpson is a conservative refinement check for these
-    // already tiny prepared gaps. Difficult/oscillatory segments fall through
-    // to the existing quarter-point adaptive Simpson recursion.
-    if (Math.abs(refined - coarse) / 3 <= tolerance) return refined;
+    // Independent noncoincident probes prevent a sinusoid sampled at its zeros
+    // from appearing flat to both the trapezoid and Simpson rules.
+    const independent = gaussThree(evaluate, lower, upper, middleValue);
+    if (Math.max(Math.abs(refined - coarse) / 3, Math.abs(refined - independent)) <= tolerance) return refined;
     return adaptiveSimpson(
       evaluate,
       lower,
@@ -303,7 +333,8 @@ function integrateFiniteSegment(
       refined,
       options.absoluteTolerance,
       options.relativeTolerance,
-      options.maximumDepth
+      options.maximumDepth,
+      independent
     );
   }
   // Starting with eight panels avoids accepting a coincidentally flat first
@@ -329,7 +360,8 @@ function integrateFiniteSegment(
       whole,
       options.absoluteTolerance / panelCount,
       options.relativeTolerance,
-      options.maximumDepth
+      options.maximumDepth,
+      gaussThree(evaluate, left, right, middleValue)
     );
   }
   return result;
@@ -345,7 +377,8 @@ function adaptiveSimpson(
   whole: number,
   absoluteTolerance: number,
   relativeTolerance: number,
-  depth: number
+  depth: number,
+  independent?: number
 ): number {
   const middle = (left + right) / 2;
   const leftMiddle = (left + middle) / 2;
@@ -369,7 +402,8 @@ function adaptiveSimpson(
   const refined = leftIntegral + rightIntegral;
   const errorEstimate = Math.abs(refined - whole) / 15;
   const tolerance = absoluteTolerance + relativeTolerance * Math.abs(refined);
-  if (errorEstimate <= tolerance) {
+  if (errorEstimate <= tolerance &&
+      (independent === undefined || Math.abs(refined - independent) <= tolerance)) {
     return refined + (refined - whole) / 15;
   }
   if (depth <= 0) {
@@ -403,6 +437,19 @@ function adaptiveSimpson(
       depth - 1
     )
   );
+}
+
+function gaussThree(
+  evaluate: (x: number) => number,
+  left: number,
+  right: number,
+  middleValue: number
+): number {
+  const half = (right - left) / 2;
+  const middle = left + half;
+  const offset = half * Math.sqrt(3 / 5);
+  return half * ((5 / 9) * (evaluate(middle - offset) + evaluate(middle + offset)) +
+    (8 / 9) * middleValue);
 }
 
 function simpson(

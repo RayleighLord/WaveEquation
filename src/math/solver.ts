@@ -1,6 +1,5 @@
 import type {
   BoundaryCondition,
-  ExpressionNode,
   SolveWaveOptions,
   SpatialDomain,
   SurfaceRange,
@@ -8,6 +7,7 @@ import type {
   WaveSolutionGrid
 } from "../types";
 import { compileExpression } from "./expression";
+import { expressionIntegrationBreakpoints, expressionIsZero } from "./features";
 import {
   compilePiecewise,
   domainBounds,
@@ -18,6 +18,7 @@ import {
   integrateFunction,
   PiecewiseAntiderivative
 } from "./quadrature";
+import { samplingResolutionNotices } from "./resolution";
 
 export const DEFAULT_X_SAMPLES = 513;
 export const DEFAULT_T_SAMPLES = 161;
@@ -61,11 +62,13 @@ interface DependencyPath {
 class CachedAntiderivative {
   private readonly cache = new Map<number, number>([[0, 0]]);
   private preparedCoordinates: number[] = [];
+  private preparedValues = new Float64Array(0);
   elapsedMs = 0;
 
   constructor(
     private readonly evaluate: (value: number) => number,
-    private readonly identicallyZero = false
+    readonly identicallyZero = false,
+    private readonly breakpoints: readonly number[] = []
   ) {}
 
   precompute(coordinates: Iterable<number>): void {
@@ -91,7 +94,8 @@ class CachedAntiderivative {
         integrateFunction(
           this.evaluate,
           unique[index - 1] as number,
-          unique[index] as number
+          unique[index] as number,
+          { breakpoints: this.breakpoints }
         );
     }
     for (let index = anchorIndex - 1; index >= 0; index -= 1) {
@@ -100,26 +104,29 @@ class CachedAntiderivative {
         integrateFunction(
           this.evaluate,
           unique[index] as number,
-          unique[index + 1] as number
+          unique[index + 1] as number,
+          { breakpoints: this.breakpoints }
         );
     }
     this.elapsedMs += now() - started;
-    for (let index = 0; index < unique.length; index += 1) {
-      this.cache.set(unique[index] as number, values[index] as number);
-    }
+    this.preparedValues = values;
+    this.cache.clear();
+    this.cache.set(0, 0);
   }
 
   at(value: number): number {
     const cached = this.cache.get(value);
     if (cached !== undefined) return cached;
     if (this.identicallyZero) return 0;
-    const nearby = nearestCoordinate(this.preparedCoordinates, value);
-    const baseCoordinate = nearby ?? 0;
-    const baseValue = this.cache.get(baseCoordinate) ?? 0;
+    const nearby = nearestCoordinateIndex(this.preparedCoordinates, value);
+    const baseCoordinate = nearby === undefined ? 0 : this.preparedCoordinates[nearby] as number;
+    const baseValue = nearby === undefined ? 0 : this.preparedValues[nearby] as number;
+    if (baseCoordinate === value) return baseValue;
     const started = now();
     const result =
-      baseValue + integrateFunction(this.evaluate, baseCoordinate, value);
+      baseValue + integrateFunction(this.evaluate, baseCoordinate, value, { breakpoints: this.breakpoints });
     this.elapsedMs += now() - started;
+    if (this.cache.size >= 4096) this.cache.delete(this.cache.keys().next().value as number);
     this.cache.set(value, result);
     return result;
   }
@@ -141,13 +148,19 @@ export function createWaveEvaluator(problem: WaveProblem): WaveEvaluator {
     ? compileBoundary(accepted.boundaries.right)
     : null;
   const bounds = domainBounds(accepted.domain);
-  const coordinateTolerance =
-    1e-11 *
-    Math.max(
-      1,
+  const localScale = Number.isFinite(bounds.lower) && Number.isFinite(bounds.upper)
+    ? bounds.upper - bounds.lower
+    : accepted.view.xMax - accepted.view.xMin;
+  // Translation changes rounding precision, not the physical size of a region
+  // that may bypass a boundary. Use a few ULPs rather than 1e-11 of the origin.
+  const coordinateTolerance = Math.max(
+    32 * Number.EPSILON * localScale,
+    4 * Number.EPSILON * Math.max(
+      localScale,
       Number.isFinite(bounds.lower) ? Math.abs(bounds.lower) : 0,
       Number.isFinite(bounds.upper) ? Math.abs(bounds.upper) : 0
-    );
+    )
+  );
   let maxReflections = 0;
 
   const baseF = (coordinate: number): number =>
@@ -286,6 +299,11 @@ export function createWaveEvaluator(problem: WaveProblem): WaveEvaluator {
   };
 
   const prepareSurface = (x: Float64Array, t: Float64Array): void => {
+    if (
+      accepted.g.pieces.every((piece) => expressionIsZero(piece.ast)) &&
+      (!leftBoundary?.integral || leftBoundary.integral.identicallyZero) &&
+      (!rightBoundary?.integral || rightBoundary.integral.identicallyZero)
+    ) return;
     const baseCoordinates = new Set<number>();
     const leftTimes = new Set<number>();
     const rightTimes = new Set<number>();
@@ -319,8 +337,15 @@ export function createWaveEvaluator(problem: WaveProblem): WaveEvaluator {
 
   const evaluate = (x: number, t: number): number => {
     assertEvaluationPoint(accepted, x, t, coordinateTolerance);
-    const result =
+    let result =
       evaluateF(x - accepted.c * t) + evaluateG(x + accepted.c * t);
+    // Exact endpoint data avoid cancellation in characteristic coordinates at
+    // large translated origins. Paths above still establish reflection stats.
+    if (x === bounds.lower && leftBoundary?.condition.kind === "dirichlet") {
+      result = boundaryValue(leftBoundary, t);
+    } else if (x === bounds.upper && rightBoundary?.condition.kind === "dirichlet") {
+      result = boundaryValue(rightBoundary, t);
+    }
     if (!Number.isFinite(result)) {
       throw new Error(`The wave solution is not finite at (x,t)=(${x},${t}).`);
     }
@@ -376,16 +401,28 @@ export function solveWaveProblem(
   evaluator.prepareSurface(x, t);
   let minimum = Number.POSITIVE_INFINITY;
   let maximum = Number.NEGATIVE_INFINITY;
+  let hasRepresentedValue = false;
+  let hasNonzeroValue = false;
 
   for (let timeIndex = 0; timeIndex < tSamples; timeIndex += 1) {
     const time = t[timeIndex] as number;
     const offset = timeIndex * xSamples;
     for (let xIndex = 0; xIndex < xSamples; xIndex += 1) {
       const value = evaluator.evaluate(x[xIndex] as number, time);
-      values[offset + xIndex] = value;
-      minimum = Math.min(minimum, value);
-      maximum = Math.max(maximum, value);
+      const represented = Math.fround(value);
+      if (!Number.isFinite(represented)) {
+        throw new Error("The solution exceeds the supported numeric range. Reduce the amplitude of the initial or boundary data.");
+      }
+      values[offset + xIndex] = represented;
+      hasRepresentedValue ||= represented !== 0;
+      hasNonzeroValue ||= value !== 0;
+      minimum = Math.min(minimum, represented);
+      maximum = Math.max(maximum, represented);
     }
+  }
+
+  if (hasNonzeroValue && !hasRepresentedValue) {
+    throw new Error("The solution amplitude is below the supported numeric range. Increase the amplitude of the initial or boundary data.");
   }
 
   const totalMs = now() - started;
@@ -397,7 +434,14 @@ export function solveWaveProblem(
     t,
     values,
     surfaceRange: niceSurfaceRange(minimum, maximum),
-    warnings: accepted.warnings.map((notice) => ({ ...notice })),
+    warnings: [
+      ...accepted.warnings.map((notice) => ({ ...notice })),
+      ...samplingResolutionNotices(
+        accepted,
+        (accepted.view.xMax - accepted.view.xMin) / (xSamples - 1),
+        accepted.T / (tSamples - 1)
+      )
+    ],
     timings: {
       totalMs,
       integrationMs,
@@ -454,7 +498,11 @@ function compileBoundary(condition: BoundaryCondition): BoundaryRuntime {
     value: checked,
     integral:
       condition.kind === "neumann"
-        ? new CachedAntiderivative(checked, isLiteralZero(condition.ast))
+        ? new CachedAntiderivative(
+          checked,
+          expressionIsZero(condition.ast),
+          expressionIntegrationBreakpoints(condition.ast)
+        )
         : null
   };
 }
@@ -522,7 +570,8 @@ function assertEvaluationPoint(
   if (!Number.isFinite(x) || !Number.isFinite(t)) {
     throw new Error("Wave solution coordinates must be finite.");
   }
-  if (t < -tolerance || t > problem.T + tolerance) {
+  const timeTolerance = 16 * Number.EPSILON * problem.T;
+  if (t < -timeTolerance || t > problem.T + timeTolerance) {
     throw new Error(`t must lie between 0 and ${problem.T}.`);
   }
   const bounds = domainBounds(problem.domain);
@@ -571,8 +620,11 @@ function linspace(lower: number, upper: number, count: number): Float64Array {
   const result = new Float64Array(count);
   const span = upper - lower;
   for (let index = 0; index < count; index += 1) {
+    const product = span * index;
     result[index] =
-      index === count - 1 ? upper : lower + (span * index) / (count - 1);
+      index === count - 1 ? upper : lower + (Number.isFinite(product)
+        ? product / (count - 1)
+        : span * (index / (count - 1)));
   }
   return result;
 }
@@ -721,12 +773,7 @@ function mix(left: number, right: number, fraction: number): number {
   return left + (right - left) * fraction;
 }
 
-function isLiteralZero(ast: ExpressionNode): boolean {
-  if (ast.type === "number") return ast.value === 0;
-  return ast.type === "unary" && isLiteralZero(ast.argument);
-}
-
-function nearestCoordinate(
+function nearestCoordinateIndex(
   coordinates: readonly number[],
   value: number
 ): number | undefined {
@@ -741,8 +788,8 @@ function nearestCoordinate(
   const lowerValue = coordinates[lower] as number;
   const upperValue = coordinates[upper] as number;
   return Math.abs(value - lowerValue) <= Math.abs(upperValue - value)
-    ? lowerValue
-    : upperValue;
+    ? lower
+    : upper;
 }
 
 function now(): number {

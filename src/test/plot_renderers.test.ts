@@ -3,11 +3,47 @@ import { Line2 } from "three/addons/lines/Line2.js";
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { SnapshotRenderer, SpaceTimeRenderer } from "../plot";
+import { SnapshotRenderer, SpaceTimeRenderer, type ProfileSampler } from "../plot";
 import type { CharacteristicTrace, WaveSolutionGrid } from "../types";
 import { makeGrid } from "./plot_fixtures";
 
 describe("SnapshotRenderer", () => {
+  it("retains an optional initial displacement comparison while the current profile changes", () => {
+    const renderer = new SnapshotRenderer(sizedHost(800, 260));
+    const grid = makeGrid();
+    renderer.setSolution(grid);
+    const initial = renderer.svg.querySelector(".snapshot-initial-curve")!;
+    expect(initial.getAttribute("visibility")).toBe("hidden");
+    renderer.setInitialProfileVisible(true);
+    expect(renderer.svg.querySelector(".snapshot-initial-legend .katex")).not.toBeNull();
+    const initialPath = initial.getAttribute("d");
+    expect(initialPath).toBe(renderer.svg.querySelector(".snapshot-curve")?.getAttribute("d"));
+    renderer.setTime(0.5);
+    expect(initial.getAttribute("d")).toBe(initialPath);
+    expect(renderer.svg.querySelector(".snapshot-curve")?.getAttribute("d")).not.toBe(initialPath);
+    renderer.setInitialProfileVisible(false);
+    expect(initial.getAttribute("visibility")).toBe("hidden");
+    expect(renderer.svg.querySelector(".snapshot-initial-curve")).toBe(initial);
+    renderer.dispose();
+  });
+
+  it("does not create a local selected marker when application selection is disabled", () => {
+    const onPointSelect = vi.fn();
+    const renderer = new SnapshotRenderer(sizedHost(800, 260), { onPointSelect });
+    renderer.setSolution(makeGrid());
+    renderer.setSelectionEnabled(false);
+    const hitArea = renderer.svg.querySelector(".snapshot-selection-hit-area")!;
+    hitArea.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 300, clientY: 100 }));
+    renderer.svg.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    expect(onPointSelect).not.toHaveBeenCalled();
+    expect(renderer.svg.dataset.selectedX).toBeUndefined();
+    renderer.setSelectionEnabled(true);
+    renderer.svg.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    expect(onPointSelect).toHaveBeenCalledOnce();
+    renderer.setSelectionEnabled(false);
+    expect(renderer.svg.dataset.selectedX).toBeUndefined();
+    renderer.dispose();
+  });
   it("retains its SVG, interpolates the snapshot, and exposes explicit axes", () => {
     const host = sizedHost(800, 260);
     const renderer = new SnapshotRenderer(host);
@@ -608,6 +644,11 @@ describe("SpaceTimeRenderer", () => {
       expect(marker.material.depthTest).toBe(false);
       expect(marker.material.depthWrite).toBe(false);
       expect(marker.renderOrder).toBeGreaterThan((surface as THREE.Mesh).renderOrder);
+      expect(marker.position.y).toBeCloseTo(0, 10);
+    }
+    const rayPositions = floorLeft.geometry.getAttribute("position");
+    for (let index = 0; index < rayPositions.count; index += 1) {
+      expect(rayPositions.getY(index)).toBeCloseTo(0, 10);
     }
     expect(host.dataset.characteristics).toBe("visible");
     expect(host.dataset.characteristicFloorPaths).toBe("2");
@@ -623,6 +664,31 @@ describe("SpaceTimeRenderer", () => {
     expect(host.dataset.characteristicFloorPaths).toBe("0");
     expect(host.dataset.characteristicMarkerLayer).toBe("hidden");
     renderer.dispose();
+  });
+
+  it("uses the same explicit jump vertices in the snapshot and gold time slice", () => {
+    const grid = makeGrid();
+    const profile = { x: new Float64Array([0, 0.7, 0.7, 2]), values: new Float32Array([0, 0, 1, 1]) };
+    const sampler: ProfileSampler = {
+      grid, sample: () => profile, initial: () => profile,
+      valueAt: (x) => x < 0.7 ? 0 : 1
+    };
+    const snapshot = new SnapshotRenderer(sizedHost(800, 260));
+    const surface = new SpaceTimeRenderer(sizedHost(900, 560));
+    for (const renderer of [snapshot, surface]) {
+      renderer.setProfileSampler(sampler, { defer: true });
+      renderer.setSolution(grid, { time: 0.371 });
+    }
+    const points = (surface.scene.getObjectByName("current-time-surface-slice") as THREE.Line).geometry.getAttribute("position");
+    expect(points.count).toBe(4);
+    expect(points.getZ(1)).toBe(points.getZ(2));
+    expect(points.getY(1)).toBe(0);
+    expect(points.getY(2)).toBe(2.5);
+    const commands = snapshot.svg.querySelector(".snapshot-curve")!.getAttribute("d")!.split(" ");
+    expect(commands[2]).toBe(commands[4]);
+    expect(commands[3]).not.toBe(commands[5]);
+    snapshot.dispose();
+    surface.dispose();
   });
 
   it("renders a regular stride-two mesh while retaining its full-resolution time slice", () => {
@@ -848,11 +914,28 @@ describe("SpaceTimeRenderer", () => {
     expect(onInteractionStart).toHaveBeenCalledWith("plane-drag");
     expect(canvas.dataset.planeDragging).toBe("true");
 
+    let pointerWorldT = -3;
+    vi.spyOn(raycaster.ray, "intersectPlane").mockImplementation((_plane, target) =>
+      target.set(pointerWorldT, 0, 0)
+    );
+    for (const coordinate of [-3, -1, 1]) {
+      pointerWorldT = coordinate;
+      canvas.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 220, clientY: 150 }));
+    }
+    expect(onTimeChange).toHaveBeenLastCalledWith(0.6, "plane-drag");
+    expect(render).not.toHaveBeenCalled();
+    expect(canvas.dataset.currentTime).toBe("0.5");
+
     canvas.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
     expect(onInteractionStart).toHaveBeenCalledWith("keyboard");
     expect(onTimeChange).toHaveBeenCalledWith(1, "keyboard");
+    // Application-owned time is requested first; its next frame synchronizes
+    // the surface, snapshot, and controls in one update.
+    expect(canvas.dataset.currentTime).toBe("0.5");
+    expect(backend.render).not.toHaveBeenCalled();
+    renderer.setTime(1);
     expect(canvas.dataset.currentTime).toBe("1");
-    expect(backend.render).toHaveBeenCalled();
+    expect(backend.render).toHaveBeenCalledTimes(1);
 
     renderer.resize(640, 360);
     expect(backend.setSize).toHaveBeenLastCalledWith(640, 360, false);

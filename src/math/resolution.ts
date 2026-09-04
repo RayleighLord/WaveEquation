@@ -1,5 +1,6 @@
-import type { SpatialDomain, WaveProblem } from "../types";
+import type { ProblemNotice, SpatialDomain, WaveProblem, WaveSolutionGrid } from "../types";
 import { evaluateExpression } from "./expression";
+import { expressionFeatures, expressionMayJump } from "./features";
 
 /** The original smooth default resolved 12 spatial units with 256 intervals. */
 export const REFERENCE_SPATIAL_SPACING = 12 / 256;
@@ -85,6 +86,10 @@ export function waveProblemMayHaveDiscontinuousDisplacement(
   problem: WaveProblem
 ): boolean {
   const pieces = problem.f.pieces;
+  if (pieces.some((piece) => expressionMayJump(piece.ast))) return true;
+  if (Object.values(problem.boundaries).some((boundary) =>
+    boundary?.kind === "dirichlet" && expressionMayJump(boundary.ast)
+  )) return true;
   const bounds = physicalBounds(problem.domain);
   const candidates = new Set<number>();
   for (const piece of pieces) {
@@ -115,6 +120,69 @@ export function waveProblemMayHaveDiscontinuousDisplacement(
     if (Math.abs(right - left) > jumpTolerance) return true;
   }
   return false;
+}
+
+/** Temporal differences never establish a spatial jump. */
+export function hasSpatialJump(grid: WaveSolutionGrid): boolean {
+  let minimum = Number.POSITIVE_INFINITY;
+  let maximum = Number.NEGATIVE_INFINITY;
+  let largestJump = 0;
+  const width = grid.x.length;
+  for (let index = 0; index < grid.values.length; index += 1) {
+    const value = grid.values[index] as number;
+    minimum = Math.min(minimum, value);
+    maximum = Math.max(maximum, value);
+    if (index % width !== 0) {
+      largestJump = Math.max(largestJump, Math.abs(value - (grid.values[index - 1] as number)));
+    }
+  }
+  const range = maximum - minimum;
+  return range > 0 && largestJump >= 0.2 * range;
+}
+
+/** At most one actionable notice per data field, even for many pieces. */
+export function samplingResolutionNotices(
+  problem: WaveProblem,
+  xSpacing: number,
+  timeSpacing: number
+): ProblemNotice[] {
+  const warnings: ProblemNotice[] = [];
+  for (const label of ["f", "g"] as const) {
+    const unresolved = problem[label].pieces.some((piece) => expressionFeatures(piece.ast).some(
+      (feature) => feature.width < 4 * xSpacing &&
+        (feature.center === undefined ||
+          (feature.center >= piece.lower && feature.center <= piece.upper &&
+           feature.center >= problem.view.xMin - problem.c * problem.T &&
+           feature.center <= problem.view.xMax + problem.c * problem.T))
+    ));
+    if (unresolved) warnings.push({
+      code: "sampling-resolution",
+      severity: "warning",
+      message: `The initial ${label === "f" ? "displacement" : "velocity"} contains a feature that may be too narrow for the current grid. Reduce the visible range or describe its support with interval bounds.`,
+      path: label
+    });
+  }
+  for (const side of ["left", "right"] as const) {
+    const boundary = problem.boundaries[side];
+    if (boundary && expressionFeatures(boundary.ast).some((feature) =>
+      feature.width < 4 * Math.max(timeSpacing, xSpacing / problem.c) &&
+      (feature.center === undefined || (feature.center >= 0 && feature.center <= problem.T))
+    )) warnings.push({
+      code: "sampling-resolution",
+      severity: "warning",
+      message: `The ${side} boundary data contain a feature that may be too fast for the current grid. Reduce the final time or visible range.`,
+      path: `boundaries.${side}.expression`
+    });
+  }
+  if (timeSpacing > REFERENCE_TIME_SPACING * (1 + 1e-12) ||
+      xSpacing * ACCEPTED_SPATIAL_OVERSAMPLE > REFERENCE_SPATIAL_SPACING * (1 + 1e-12)) {
+    warnings.push({
+      code: "sampling-resolution",
+      severity: "warning",
+      message: "The display resolution limit has been reached. Small or rapidly moving features may be missed; reduce the final time or visible range."
+    });
+  }
+  return warnings;
 }
 
 function evaluateInitialDisplacement(problem: WaveProblem, x: number): number {

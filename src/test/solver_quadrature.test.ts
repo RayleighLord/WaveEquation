@@ -6,6 +6,24 @@ import {
 } from "../math/quadrature";
 
 describe("refinement-checked piecewise quadrature", () => {
+  it("does not mistake commensurate sinusoidal samples for a zero integral", () => {
+    const problem = velocityProblem("sin(32 * x)^2");
+    expect(integratePiecewise(problem.g, 0, Math.PI)).toBeCloseTo(Math.PI / 2, 8);
+
+    const rapidlyOscillating = velocityProblem("sin(2000 * pi * x)^2");
+    const prepared = new PiecewiseAntiderivative(rapidlyOscillating.g, 0);
+    prepared.precompute(Array.from({ length: 1001 }, (_, index) => index / 1000));
+    expect(prepared.at(1)).toBeCloseTo(0.5, 8);
+  });
+
+  it.each([0.01, -0.013, 0.377])("resolves a narrow shifted Gaussian at %s", (center) => {
+    const problem = velocityProblem(`10000 * exp(-10000000000 * (x - (${center}))^2)`);
+    const expected = Math.sqrt(Math.PI) / 10;
+    expect(integratePiecewise(problem.g, -1, 1)).toBeCloseTo(expected, 8);
+    const prepared = new PiecewiseAntiderivative(problem.g, 0);
+    prepared.precompute([-1, -0.5, 0, 0.5, 1]);
+    expect(prepared.integral(-1, 1)).toBeCloseTo(expected, 8);
+  });
   it("splits the integral at declared piece boundaries", () => {
     const problem = createWaveProblem({
       c: 1,
@@ -88,3 +106,15 @@ describe("refinement-checked piecewise quadrature", () => {
     }
   });
 });
+
+function velocityProblem(expression: string) {
+  return createWaveProblem({
+    c: 1,
+    T: 1,
+    domain: { kind: "infinite" },
+    view: { xMin: -1, xMax: 1 },
+    f: [{ id: "f", expression: "0", lower: "-inf", upper: "inf" }],
+    g: [{ id: "g", expression, lower: "-inf", upper: "inf" }],
+    boundaries: {}
+  });
+}

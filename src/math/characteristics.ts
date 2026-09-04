@@ -39,11 +39,15 @@ export function traceCharacteristics(
   const xMaximum = grid.x[grid.x.length - 1] as number;
   const tMinimum = grid.t[0] as number;
   const tMaximum = grid.t[grid.t.length - 1] as number;
-  const tolerance = 1e-10 * Math.max(1, Math.abs(xMinimum), Math.abs(xMaximum));
+  const tolerance = Math.max(
+    32 * Number.EPSILON * (xMaximum - xMinimum),
+    4 * Number.EPSILON * Math.max(xMaximum - xMinimum, Math.abs(xMinimum), Math.abs(xMaximum))
+  );
   if (x < xMinimum - tolerance || x > xMaximum + tolerance) {
     throw new Error("The selected x-coordinate lies outside the displayed surface.");
   }
-  if (t < tMinimum - tolerance || t > tMaximum + tolerance) {
+  const timeTolerance = 16 * Number.EPSILON * accepted.T;
+  if (t < tMinimum - timeTolerance || t > tMaximum + timeTolerance) {
     throw new Error("The selected time lies outside the displayed surface.");
   }
 
@@ -101,7 +105,8 @@ function traceOnePath(
   const timeStep =
     ((grid.t[grid.t.length - 1] as number) - (grid.t[0] as number)) /
     (grid.t.length - 1);
-  const epsilon = 1e-11 * Math.max(1, problem.T);
+  const epsilon = 16 * Number.EPSILON * problem.T;
+  const spatialTolerance = 4 * Number.EPSILON * Math.max(problem.view.xMax - problem.view.xMin, Math.abs(start.x));
 
   while (currentT > epsilon) {
     const side = direction < 0 ? "left" : "right";
@@ -125,7 +130,7 @@ function traceOnePath(
 
     const distance =
       direction < 0 ? currentX - boundaryX : boundaryX - currentX;
-    if (distance < -epsilon) {
+    if (distance < -spatialTolerance) {
       throw new Error("A characteristic escaped the physical domain.");
     }
     const travelTime = Math.max(0, distance / problem.c);

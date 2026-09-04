@@ -16,6 +16,7 @@ import {
 } from "./svg";
 import { axisValueToLatex, axisValueToText, renderLatex } from "./latex";
 import { axisTicks, type AxisValueNotation } from "./ticks";
+import type { ProfileSampler, SampledProfile } from "./profile";
 
 export { niceAxisTicks } from "./ticks";
 
@@ -27,6 +28,7 @@ export interface SnapshotPresentationUpdateOptions {
 export interface SnapshotSolutionUpdateOptions {
   /** The revision-safe worker client already validated the complete grid. */
   validated?: boolean;
+  time?: number;
 }
 
 export interface SnapshotRendererOptions {
@@ -80,6 +82,8 @@ export class SnapshotRenderer {
   private readonly footpointLayer: SVGGElement;
   private readonly boundaryLayer: SVGGElement;
   private readonly curve: SVGPathElement;
+  private readonly initialCurve: SVGPathElement;
+  private readonly initialLegend: SVGGElement;
   private readonly selectionGuide: SVGLineElement;
   private readonly selectedPoint: SVGCircleElement;
   private readonly selectedPointHalo: SVGCircleElement;
@@ -89,6 +93,9 @@ export class SnapshotRenderer {
 
   private geometry: SnapshotGeometry;
   private solution: WaveSolutionGrid | null = null;
+  private profileSampler: ProfileSampler | null = null;
+  private initialProfileVisible = false;
+  private selectionEnabled = true;
   private time = 0;
   private selectedX: number | null = null;
   private characteristics: CharacteristicTrace | null = null;
@@ -168,6 +175,18 @@ export class SnapshotRenderer {
     this.footpointLayer = createSvgElement("g", "snapshot-characteristic-projection");
     this.footpointLayer.setAttribute("aria-hidden", "true");
     this.curve = createSvgElement("path", "snapshot-curve");
+    this.initialCurve = createSvgElement("path", "snapshot-initial-curve");
+    setSvgAttributes(this.initialCurve, {
+      fill: "none",
+      stroke: "#d6dde7",
+      "stroke-width": 2,
+      "stroke-dasharray": "6 5",
+      "vector-effect": "non-scaling-stroke",
+      "pointer-events": "none",
+      "aria-label": "Initial displacement f(x)",
+      visibility: "hidden"
+    });
+    clippedLayer.append(this.initialCurve);
     setSvgAttributes(this.curve, {
       fill: "none",
       stroke: "#4fcbd3",
@@ -238,6 +257,29 @@ export class SnapshotRenderer {
       "aria-hidden": "true"
     });
     this.svg.append(this.hitArea);
+    this.initialLegend = createSvgElement("g", "snapshot-initial-legend");
+    setSvgAttributes(this.initialLegend, {
+      visibility: "hidden",
+      "pointer-events": "none",
+      role: "img",
+      "aria-label": "Dashed light curve: initial displacement f(x)"
+    });
+    const legendLine = createSvgElement("line");
+    setSvgAttributes(legendLine, {
+      x1: 0, x2: 32, y1: 0, y2: 0,
+      stroke: "#d6dde7",
+      "stroke-width": 2,
+      "stroke-dasharray": "6 5"
+    });
+    const legendMath = createSvgElement("foreignObject");
+    setSvgAttributes(legendMath, { x: 40, y: -18, width: 72, height: 36 });
+    const legendContent = document.createElement("span");
+    legendContent.className = "snapshot-latex-label snapshot-latex-label--tick";
+    legendContent.dataset.anchor = "start";
+    renderLatex(legendContent, "f(x)", { ariaHidden: true });
+    legendMath.append(legendContent);
+    this.initialLegend.append(legendLine, legendMath);
+    this.svg.append(this.initialLegend);
 
     this.svg.dataset.xAxisArrow = xAxisArrowId;
     this.svg.dataset.uAxisArrow = uAxisArrowId;
@@ -283,7 +325,7 @@ export class SnapshotRenderer {
     }
     if (!options.validated) validateSolutionGrid(solution);
     this.solution = solution;
-    this.time = clampGridTime(solution, this.time);
+    this.time = clampGridTime(solution, options.time ?? this.time);
     if (this.selectedX !== null) {
       this.selectedX = clamp(
         this.selectedX,
@@ -292,6 +334,31 @@ export class SnapshotRenderer {
       );
     }
     this.paint(true);
+  }
+
+  setProfileSampler(
+    sampler: ProfileSampler | null,
+    options: SnapshotPresentationUpdateOptions = {}
+  ): void {
+    if (this.destroyed) return;
+    this.profileSampler = sampler;
+    if (!options.defer && this.solution) this.paint(true);
+  }
+
+  setInitialProfileVisible(visible: boolean): void {
+    if (this.destroyed) return;
+    this.initialProfileVisible = visible;
+    this.paintInitialProfile();
+    this.updateDescription();
+  }
+
+  setSelectionEnabled(enabled: boolean): void {
+    if (this.destroyed) return;
+    this.selectionEnabled = enabled;
+    this.svg.dataset.selectionEnabled = String(enabled);
+    this.hitArea.setAttribute("cursor", enabled ? "crosshair" : "default");
+    if (!enabled) this.setSelectedX(null);
+    this.updateDescription();
   }
 
   setTime(time: number): void {
@@ -392,11 +459,15 @@ export class SnapshotRenderer {
 
   clear(): void {
     this.solution = null;
+    this.profileSampler = null;
     this.characteristics = null;
     this.selectedX = null;
     this.boundaryPositions = [];
     this.boundaryMarkers = [];
     this.curve.removeAttribute("d");
+    this.initialCurve.removeAttribute("d");
+    this.initialCurve.setAttribute("visibility", "hidden");
+    this.initialLegend.setAttribute("visibility", "hidden");
     this.footpointLayer.replaceChildren();
     this.boundaryLayer.replaceChildren();
     this.emptyLabel.style.display = "";
@@ -432,6 +503,7 @@ export class SnapshotRenderer {
       return;
     }
     this.destroyed = true;
+    this.profileSampler = null;
     this.resizeObserver?.disconnect();
     this.hitArea.removeEventListener("pointerdown", this.handlePointerDown);
     this.svg.removeEventListener("keydown", this.handleKeyDown);
@@ -439,7 +511,7 @@ export class SnapshotRenderer {
   }
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
-    if (!this.solution || this.destroyed) {
+    if (!this.solution || this.destroyed || !this.selectionEnabled) {
       return;
     }
     event.preventDefault();
@@ -458,7 +530,7 @@ export class SnapshotRenderer {
   };
 
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
-    if (!this.solution || this.destroyed) {
+    if (!this.solution || this.destroyed || !this.selectionEnabled) {
       return;
     }
     const last = this.solution.x.length - 1;
@@ -502,14 +574,10 @@ export class SnapshotRenderer {
     const range = normalizedSurfaceRange(solution);
     const xMin = Number(solution.x[0]);
     const xMax = Number(solution.x[solution.x.length - 1]);
-    const values = sampleSlice(solution, this.time);
-    const commands = new Array<string>(solution.x.length);
-    for (let index = 0; index < solution.x.length; index += 1) {
-      const pointX = this.mapX(Number(solution.x[index]), xMin, xMax);
-      const pointY = this.mapY(Number(values[index]), range.min, range.max);
-      commands[index] = `${index === 0 ? "M" : "L"}${compactNumber(pointX)} ${compactNumber(pointY)}`;
-    }
-    this.curve.setAttribute("d", commands.join(" "));
+    const profile = this.profileSampler?.grid === solution
+      ? this.profileSampler.sample(this.time)
+      : { x: solution.x, values: sampleSlice(solution, this.time) };
+    this.curve.setAttribute("d", this.profilePath(profile));
     this.emptyLabel.style.display = "none";
     setSvgAttributes(this.svg, {
       "data-geometry-ready": "true",
@@ -520,10 +588,46 @@ export class SnapshotRenderer {
     if (layoutChanged) {
       this.renderAxes(xMin, xMax, range.min, range.max);
       this.paintFootpoints();
+      this.paintInitialProfile();
     }
     this.paintSelection();
     this.paintBoundaries();
     this.updateDescription();
+  }
+
+  private profilePath(profile: SampledProfile): string {
+    if (!this.solution) return "";
+    const range = normalizedSurfaceRange(this.solution);
+    const xMin = Number(this.solution.x[0]);
+    const xMax = Number(this.solution.x[this.solution.x.length - 1]);
+    return Array.from(profile.x, (x, index) => {
+      const pointX = compactNumber(this.mapX(x, xMin, xMax));
+      const pointY = compactNumber(this.mapY(
+        Number(profile.values[index]), range.min, range.max
+      ));
+      return `${index === 0 ? "M" : "L"}${pointX} ${pointY}`;
+    }).join(" ");
+  }
+
+  private paintInitialProfile(): void {
+    if (!this.initialProfileVisible || !this.solution) {
+      this.initialCurve.setAttribute("visibility", "hidden");
+      this.initialLegend.setAttribute("visibility", "hidden");
+      return;
+    }
+    const profile = this.profileSampler?.grid === this.solution
+      ? this.profileSampler.initial()
+      : { x: this.solution.x, values: sampleSlice(this.solution, 0) };
+    this.initialCurve.setAttribute("d", this.profilePath(profile));
+    this.initialCurve.setAttribute("visibility", "visible");
+    this.initialLegend.setAttribute("visibility", "visible");
+  }
+
+  private valueAt(x: number, time = this.time): number {
+    if (!this.solution) return 0;
+    return this.profileSampler?.grid === this.solution
+      ? this.profileSampler.valueAt(x, time)
+      : sampleSolutionGrid(this.solution, x, time);
   }
 
   private paintSelection(): void {
@@ -536,7 +640,7 @@ export class SnapshotRenderer {
     const xMin = Number(this.solution.x[0]);
     const xMax = Number(this.solution.x[this.solution.x.length - 1]);
     const x = this.mapX(this.selectedX, xMin, xMax);
-    const value = sampleSolutionGrid(this.solution, this.selectedX, this.time);
+    const value = this.valueAt(this.selectedX);
     const y = this.mapY(value, range.min, range.max);
     setSvgAttributes(this.selectionGuide, {
       x1: x,
@@ -611,7 +715,7 @@ export class SnapshotRenderer {
         continue;
       }
       const displayedPosition = clamp(position, xMin, xMax);
-      const value = sampleSolutionGrid(this.solution, displayedPosition, this.time);
+      const value = this.valueAt(displayedPosition);
       setSvgAttributes(marker, {
         cx: this.mapX(displayedPosition, xMin, xMax),
         cy: this.mapY(value, range.min, range.max),
@@ -847,6 +951,7 @@ export class SnapshotRenderer {
   private layout(): void {
     const { width, height, left, right, top, bottom } = this.geometry;
     this.svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    this.initialLegend.setAttribute("transform", `translate(${Math.max(left, right - 115)}, ${top - 27})`);
     setSvgAttributes(this.background, { x: 0, y: 0, width, height });
     const clipRect = this.svg.querySelector<SVGRectElement>("[data-snapshot-clip]");
     if (clipRect) {
@@ -917,7 +1022,7 @@ export class SnapshotRenderer {
       this.selectedX === null
         ? "No characteristic point is selected."
         : `The selected point is x ${axisValueToText(this.selectedX, this.xAxisNotation)}, u ${formatAxisValue(
-            sampleSolutionGrid(this.solution, this.selectedX, this.time)
+            this.valueAt(this.selectedX)
           )}.`;
     const etaFootpoint = this.characteristics?.footpoints.find(
       (footpoint) => footpoint.path === "left"
@@ -938,7 +1043,7 @@ export class SnapshotRenderer {
       .filter((position) => position >= xMin && position <= xMax)
       .map((position) => ({
         position,
-        value: sampleSolutionGrid(this.solution!, position, this.time)
+        value: this.valueAt(position)
       }));
     const boundaries = visibleBoundaries.length > 0
       ? ` Physical boundary ${visibleBoundaries.length === 1 ? "marker is" : "markers are"} shown at ${visibleBoundaries
@@ -953,6 +1058,9 @@ export class SnapshotRenderer {
         xMin,
         this.xAxisNotation
       )} to ${axisValueToText(xMax, this.xAxisNotation)}. ${selected}${traces}${boundaries} ` +
-      "Click the curve or use Left and Right Arrow keys to choose a point.";
+      (this.initialProfileVisible ? "The dashed light curve shows the initial displacement f(x). " : "") +
+      (this.selectionEnabled
+        ? "Click the curve or use Left and Right Arrow keys to choose a point."
+        : "Open Characteristics to select a point on the curve.");
   }
 }

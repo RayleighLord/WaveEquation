@@ -4,6 +4,7 @@ import {
   evaluateExpression,
   getWavePreset,
   getWavePresetInput,
+  hasSpatialJump,
   parseExpression,
   validateWaveProblem,
   type ProductDomainKind,
@@ -201,33 +202,50 @@ export class WaveAppController {
   addPiece(source: PieceSource): boolean {
     const pieces = this.state.draft[source].map((piece) => ({ ...piece }));
     if (pieces.length >= 16) {
-      this.state = {
-        ...this.state,
-        status: "invalid",
-        statusMessage: "Use at most 16 intervals for each initial function."
-      };
-      this.emit();
+      this.rejectDraft("Use at most 16 intervals for each initial function.", source, "invalid-piece");
       return false;
     }
     const last = pieces.at(-1);
     if (!last) return false;
-    const lower = parseEditableBound(last.lower);
-    const upper = parseEditableBound(last.upper);
+    const parsedBounds = { lower: 0, upper: 0 };
+    for (const field of ["lower", "upper"] as const) {
+      try {
+        parsedBounds[field] = parseEditableBound(last[field]);
+      } catch (error) {
+        this.rejectDraft(
+          error instanceof Error ? error.message : "Enter a valid interval bound.",
+          `${source}[${pieces.length - 1}].${field}`,
+          "invalid-piece"
+        );
+        return false;
+      }
+    }
+    const { lower, upper } = parsedBounds;
+    if (!(lower < upper)) {
+      this.rejectDraft("The lower bound must be smaller than the upper bound.",
+        `${source}[${pieces.length - 1}].bounds`, "invalid-piece");
+      return false;
+    }
     const viewMin = tryParseFiniteScalarExpression(this.state.draft.xMin);
     const viewMax = tryParseFiniteScalarExpression(this.state.draft.xMax);
     let split: number;
     if (Number.isFinite(lower) && Number.isFinite(upper) && upper > lower) {
-      split = (lower + upper) / 2;
+      split = lower / 2 + upper / 2;
     } else if (!Number.isFinite(lower) && !Number.isFinite(upper)) {
       split = Number.isFinite(viewMin) && Number.isFinite(viewMax)
-        ? (viewMin + viewMax) / 2
+        ? viewMin / 2 + viewMax / 2
         : 0;
     } else if (Number.isFinite(lower)) {
       split = Number.isFinite(viewMax) && viewMax > lower ? viewMax : lower + 1;
     } else {
       split = Number.isFinite(viewMin) && viewMin < upper ? viewMin : upper - 1;
     }
-    const boundary = formatNumber(split);
+    if (!Number.isFinite(split) || !(lower < split && split < upper)) {
+      this.rejectDraft("This interval is too narrow to split into two distinct intervals.",
+        `${source}[${pieces.length - 1}].bounds`, "invalid-piece");
+      return false;
+    }
+    const boundary = String(split);
     last.upper = boundary;
     pieces.push({
       id: `custom-${source}-${this.nextPieceId++}`,
@@ -278,7 +296,10 @@ export class WaveAppController {
     try {
       input = inputFromDraft(this.state.draft);
     } catch (error) {
-      this.rejectDraft(error instanceof Error ? error.message : "Invalid problem input.");
+      this.rejectDraft(
+        error instanceof Error ? error.message : "Invalid problem input.",
+        error instanceof DraftFieldError ? error.path : undefined
+      );
       return false;
     }
     const validation = validateWaveProblem(input);
@@ -341,12 +362,17 @@ export class WaveAppController {
     this.emit();
   }
 
-  private rejectDraft(message: string): void {
+  private rejectDraft(
+    message: string,
+    path?: string,
+    code: ProblemNotice["code"] = "invalid-number"
+  ): void {
     this.pendingProblems.clear();
     this.state = {
       ...this.state,
       status: "invalid",
       statusMessage: message,
+      errors: [{ code, severity: "error", message, ...(path ? { path } : {}) }],
       pendingRevision: null
     };
     this.emit();
@@ -356,6 +382,24 @@ export class WaveAppController {
     if (result.revision !== this.state.pendingRevision) return;
     const problem = this.pendingProblems.get(result.revision);
     if (!problem || result.problemSignature !== problem.signature) return;
+    // Detect boundary-generated and expression-internal jumps in every row.
+    // A coarse discovery solve must never replace the last accepted surface.
+    const cutCounts = adaptiveAcceptedSampleCounts(problem, true);
+    if (hasSpatialJump(result) &&
+        (result.x.length < cutCounts.xSamples || result.t.length < cutCounts.tSamples)) {
+      const revision = this.worker.currentRevision + 1;
+      this.pendingProblems.clear();
+      this.pendingProblems.set(revision, problem);
+      this.state = {
+        ...this.state,
+        status: "solving",
+        statusMessage: "Resolving wave fronts…",
+        pendingRevision: revision
+      };
+      this.emit();
+      this.worker.solve(problem, cutCounts);
+      return;
+    }
     this.pendingProblems.clear();
     const warnings = result.warnings;
     this.state = {
@@ -427,15 +471,15 @@ function pieceToDraft(piece: ExpressionPieceDraft): EditablePiece {
 function inputFromDraft(draft: WaveProblemDraft): WaveProblemInput {
   const T = parseFiniteScalarExpression(
     draft.T,
-    "Final time must be a finite constant expression."
+    "Final time must be a finite constant expression.", "T"
   );
   const xMin = parseFiniteScalarExpression(
     draft.xMin,
-    "View minimum must be a finite constant expression."
+    "View minimum must be a finite constant expression.", "view.xMin"
   );
   const xMax = parseFiniteScalarExpression(
     draft.xMax,
-    "View maximum must be a finite constant expression."
+    "View maximum must be a finite constant expression.", "view.xMax"
   );
   const domain: SpatialDomain = draft.domainKind === "infinite"
     ? { kind: "infinite" }
@@ -444,18 +488,18 @@ function inputFromDraft(draft: WaveProblemDraft): WaveProblemInput {
           kind: "right-half-line",
           left: parseFiniteScalarExpression(
             draft.domainLeft,
-            "Left endpoint must be a finite constant expression."
+            "Left endpoint must be a finite constant expression.", "domain.left"
           )
         }
       : {
           kind: "finite",
           left: parseFiniteScalarExpression(
             draft.domainLeft,
-            "Left endpoint must be a finite constant expression."
+            "Left endpoint must be a finite constant expression.", "domain.left"
           ),
           right: parseFiniteScalarExpression(
             draft.domainRight,
-            "Right endpoint must be a finite constant expression."
+            "Right endpoint must be a finite constant expression.", "domain.right"
           )
         };
 
@@ -508,7 +552,13 @@ function parseEditableBound(source: string): number {
 }
 
 /** Evaluate a constant-only scalar through the same whitelisted AST as f, g, h and q. */
-function parseFiniteScalarExpression(source: string, message: string): number {
+class DraftFieldError extends Error {
+  constructor(message: string, readonly path: string) {
+    super(message);
+  }
+}
+
+function parseFiniteScalarExpression(source: string, message: string, path?: string): number {
   try {
     const ast = parseExpression(source.trim().replace(/−/g, "-"), {
       variable: "none"
@@ -517,7 +567,7 @@ function parseFiniteScalarExpression(source: string, message: string): number {
     if (!Number.isFinite(value)) throw new Error(message);
     return value;
   } catch {
-    throw new Error(message);
+    throw path ? new DraftFieldError(message, path) : new Error(message);
   }
 }
 

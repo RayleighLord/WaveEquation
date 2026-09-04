@@ -6,6 +6,7 @@ import {
 } from "../math/solver";
 import { createWaveProblem } from "../math/problem";
 import { getWavePresetProblem } from "../math/presets";
+import { adaptiveAcceptedSampleCounts } from "../math/resolution";
 import type {
   BoundaryConditionDraft,
   BoundaryKind,
@@ -13,6 +14,104 @@ import type {
 } from "../types";
 
 describe("semianalytic wave solver", () => {
+  it("resolves the integrated effect of a narrow velocity pulse and reports its display limit", () => {
+    const problem = createWaveProblem({
+      c: 1, T: 8,
+      domain: { kind: "infinite" }, view: { xMin: -6, xMax: 6 },
+      f: [{ id: "f", expression: "0", lower: "-inf", upper: "inf" }],
+      g: [{ id: "g", expression: "10000 * exp(-10000000000 * (x - 0.01)^2)", lower: "-inf", upper: "inf" }],
+      boundaries: {}
+    });
+    const grid = solveWaveProblem(problem, adaptiveAcceptedSampleCounts(problem));
+    expect(sampleSolution(grid, 0, 8)).toBeCloseTo(Math.sqrt(Math.PI) / 20, 7);
+    expect(grid.warnings.filter((notice) => notice.path === "g" && notice.code === "sampling-resolution"))
+      .toHaveLength(1);
+  });
+
+  it("retains nonzero Neumann integration when initial velocity is zero", () => {
+    const problem = createWaveProblem({
+      c: 1, T: Math.PI,
+      domain: { kind: "right-half-line", left: 0 }, view: { xMin: 0, xMax: Math.PI },
+      f: [{ id: "f", expression: "0", lower: 0, upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: 0, upper: "inf" }],
+      boundaries: { left: { kind: "neumann", expression: "sin(32 * t)^2" } }
+    });
+    const grid = solveWaveProblem(problem, { xSamples: 3, tSamples: 3 });
+    expect(sampleSolution(grid, 0, Math.PI)).toBeCloseTo(-Math.PI / 2, 6);
+    expect(grid.timings.integrationMs).toBeGreaterThan(0);
+  });
+
+  it("integrates a weak Neumann boundary step at its true event time", () => {
+    const problem = createWaveProblem({
+      c: 1, T: 2,
+      domain: { kind: "right-half-line", left: 0 }, view: { xMin: 0, xMax: 2 },
+      f: [{ id: "f", expression: "0", lower: 0, upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: 0, upper: "inf" }],
+      boundaries: { left: { kind: "neumann", expression: "(1 + sign(t - 0.37)) / 2" } }
+    });
+    const evaluator = createWaveEvaluator(problem);
+    expect(evaluator.evaluate(0, 1.2)).toBeCloseTo(-0.83, 8);
+    expect(evaluator.evaluate(0.2, 1.2)).toBeCloseTo(-0.63, 8);
+    expect(evaluator.evaluate(0.9, 1.2)).toBeCloseTo(0, 8);
+  });
+
+  it("preserves antiderivative anchors across repeated profile preparation", () => {
+    const problem = createWaveProblem({
+      c: 1, T: 3,
+      domain: { kind: "finite", left: 0, right: 1 }, view: { xMin: 0, xMax: 1 },
+      f: [{ id: "f", expression: "x", lower: 0, upper: 1 }],
+      g: [{ id: "g", expression: "1", lower: 0, upper: 1 }],
+      boundaries: {
+        left: { kind: "neumann", expression: "1" },
+        right: { kind: "neumann", expression: "1" }
+      }
+    });
+    const evaluator = createWaveEvaluator(problem);
+    const positions = Float64Array.from({ length: 17 }, (_, index) => index / 16);
+    for (const time of [0.25, 0.3, 1, 2.77, 0.1]) {
+      evaluator.prepareSurface(positions, Float64Array.of(time));
+      for (const x of [0, 0.123, 0.555, 1]) expect(evaluator.evaluate(x, time)).toBeCloseTo(x + time, 8);
+    }
+  });
+
+  it("preserves zero-Neumann eigenmodes through the reflection limit without quadrature", () => {
+    const input = eigenmodeProblem("neumann", "neumann", "cos(pi * x)");
+    const problem = createWaveProblem({
+      ...input, T: 64,
+      f: [{ id: "f", expression: "cos(pi * x)", lower: 0, upper: 1 }],
+      g: [{ id: "g", expression: "-0", lower: 0, upper: 1 }]
+    });
+    const grid = solveWaveProblem(problem, { xSamples: 17, tSamples: 65 });
+    expect(sampleSolution(grid, 0.5, 64)).toBeCloseTo(0, 7);
+    expect(sampleSolution(grid, 0, 64)).toBeCloseTo(1, 7);
+    expect(grid.reflectionCount).toBe(64);
+    expect(grid.timings.integrationMs).toBe(0);
+  });
+
+  it.each(["1e40", "1e-50"])("reports unsupported amplitude %s without a corrupt grid", (expression) => {
+    const problem = createWaveProblem({
+      c: 1, T: 1,
+      domain: { kind: "infinite" }, view: { xMin: -1, xMax: 1 },
+      f: [{ id: "f", expression, lower: "-inf", upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: "-inf", upper: "inf" }], boundaries: {}
+    });
+    expect(() => solveWaveProblem(problem, { xSamples: 3, tSamples: 3 })).toThrow(/supported numeric range/);
+  });
+
+  it.each([0, 1e10])("preserves a driven solution translated to a=%s", (left) => {
+    const problem = createWaveProblem({
+      c: 1, T: 1,
+      domain: { kind: "right-half-line", left }, view: { xMin: left, xMax: left + 1 },
+      f: [{ id: "f", expression: "0", lower: left, upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: left, upper: "inf" }],
+      boundaries: { left: { kind: "dirichlet", expression: "t" } }
+    });
+    const evaluator = createWaveEvaluator(problem);
+    expect(evaluator.evaluate(left, 0.05)).toBe(0.05);
+    expect(evaluator.evaluate(left + 0.02, 0.05)).toBeCloseTo(0.03, 5);
+    expect(() => evaluator.evaluate(left, -0.001)).toThrow(/t must lie/);
+  });
+
   it("matches d'Alembert's formula on the infinite line", () => {
     const evaluator = createWaveEvaluator(createWaveProblem({
       c: 1,

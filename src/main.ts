@@ -3,4 +3,5 @@ import "./styles/main.css";
 
 import { startApp } from "./app";
 
-startApp();
+const dispose = startApp();
+if (import.meta.hot) import.meta.hot.dispose(dispose);

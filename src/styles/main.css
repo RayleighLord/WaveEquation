@@ -423,7 +423,7 @@ select:focus-visible,
   min-width: 0;
   gap: 0.14rem;
   color: var(--faint);
-  font-size: 0.54rem;
+  font-size: 0.65rem;
   font-weight: 820;
   letter-spacing: 0.045em;
   text-transform: uppercase;
@@ -438,10 +438,9 @@ input[type="number"] {
   padding: 0.3rem 0.48rem;
   border: 1px solid rgba(158, 176, 255, 0.25);
   border-radius: 8px;
-  outline: 0;
   color: var(--ink);
   background: rgba(1, 5, 10, 0.75);
-  font-size: 0.67rem;
+  font-size: 0.78rem;
   font-weight: 700;
   letter-spacing: normal;
   text-transform: none;
@@ -463,16 +462,16 @@ select[aria-invalid="true"] {
   min-width: 0;
   margin: 0;
   padding: 0.42rem;
-  border: 1px solid rgba(158, 176, 255, 0.12);
+  border: 1px solid rgba(158, 176, 255, 0.08);
   border-radius: 10px;
-  background: var(--panel-soft);
+  background: rgba(12, 20, 31, 0.3);
 }
 
 .piece-editor legend,
 .boundary-fields legend {
   padding-inline: 0.28rem;
   color: var(--muted);
-  font-size: 0.61rem;
+  font-size: 0.72rem;
   font-weight: 800;
 }
 
@@ -503,26 +502,20 @@ select[aria-invalid="true"] {
   font-size: 1.16em;
 }
 
-.piece-headings,
 .piece-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.7fr) 3rem 3rem 2.75rem;
-  gap: 0.3rem;
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 2.75rem;
+  gap: 0.4rem;
+  align-items: start;
 }
 
 .piece-headings {
-  padding: 0 0.1rem 0.15rem;
-  color: var(--faint);
-  font-size: 0.49rem;
-  font-weight: 820;
-  letter-spacing: 0.045em;
-  text-transform: uppercase;
+  display: none;
 }
 
 .piece-list {
   display: grid;
-  gap: 0.24rem;
+  gap: 0.8rem;
 }
 
 .piece-field {
@@ -530,13 +523,21 @@ select[aria-invalid="true"] {
   min-width: 0;
 }
 
+.piece-field--expression {
+  grid-column: 1 / -1;
+}
+
 .piece-row input {
   padding-inline: 0.42rem;
-  font-size: 0.63rem;
+  font-size: 0.78rem;
 }
 
 .mobile-field-label {
-  display: none;
+  display: block;
+  margin: 0 0 0.18rem 0.06rem;
+  color: var(--muted);
+  font-size: 0.65rem;
+  line-height: 1.3;
 }
 
 .remove-piece-button {
@@ -549,6 +550,7 @@ select[aria-invalid="true"] {
   color: var(--muted);
   background: rgba(158, 176, 255, 0.075);
   font-size: 1.08rem;
+  margin-top: 0.82rem;
 }
 
 .soft-button {
@@ -565,6 +567,56 @@ select[aria-invalid="true"] {
 .add-piece-button {
   width: 100%;
   margin-top: 0.24rem;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.add-piece-button:hover {
+  background: rgba(158, 176, 255, 0.07);
+  color: var(--ink);
+}
+
+.example-observation {
+  margin: 0.1rem 0 0.35rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+.field-error {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--invalid);
+  font-family: var(--font-sans);
+  font-size: 0.68rem;
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+  overflow-wrap: anywhere;
+}
+
+.accepted-problem-notice {
+  margin: 0 0 0.35rem;
+  color: var(--muted);
+}
+
+.comparison-option {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+
+.comparison-option input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--cool);
 }
 
 .boundary-grid {
@@ -579,7 +631,7 @@ select[aria-invalid="true"] {
 .problem-feedback {
   min-height: 1rem;
   color: var(--muted);
-  font-size: 0.59rem;
+  font-size: 0.7rem;
   line-height: 1.38;
 }
 
@@ -1086,7 +1138,7 @@ body[data-ui-hidden="true"] .problem-control,
     z-index: 0;
     inset: auto;
     display: grid;
-    grid-template-rows: clamp(21rem, 54svh, 28rem) clamp(13rem, 34svh, 18rem);
+    grid-template-rows: clamp(21rem, 54svh, 28rem) auto clamp(13rem, 34svh, 18rem);
     row-gap: 0.72rem;
     height: auto;
     min-height: 0;
@@ -1097,6 +1149,7 @@ body[data-ui-hidden="true"] .problem-control,
   #snapshot-section {
     width: 100%;
     justify-self: stretch;
+    grid-row: 3;
   }
 
   .view-controls {
@@ -1169,21 +1222,21 @@ body[data-ui-hidden="true"] .problem-control,
     display: block;
     margin: 0 0 0.18rem 0.06rem;
     color: var(--faint);
-    font-size: 0.54rem;
+    font-size: 0.65rem;
     font-weight: 820;
     letter-spacing: 0.04em;
     text-transform: uppercase;
   }
 
   .piece-row {
-    grid-template-columns: minmax(0, 1fr) 3.45rem 3.45rem 2.75rem;
-    gap: 0.28rem;
-    align-items: end;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 2.75rem;
+    gap: 0.4rem;
+    align-items: start;
   }
 
   .piece-row input {
     padding-inline: 0.38rem;
-    font-size: 0.61rem;
+    font-size: 0.85rem;
   }
 
   .view-controls .compact-button > span {
@@ -1191,7 +1244,7 @@ body[data-ui-hidden="true"] .problem-control,
   }
 
   .wave-stage {
-    grid-template-rows: 21rem 13.5rem;
+    grid-template-rows: 21rem auto 13.5rem;
   }
 
   .time-ticks {

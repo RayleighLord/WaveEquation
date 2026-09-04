@@ -108,6 +108,33 @@ describe("SpaceTimeRenderer coordinate orientation", () => {
     renderer.dispose();
   });
 
+  it("fits compact reset views with room for complete mathematical labels", () => {
+    const host = sizedHost();
+    const renderer = new SpaceTimeRenderer(host);
+    renderer.setSolution(makeGrid());
+    renderer.resize(320, 360);
+    renderer.camera.updateMatrixWorld(true);
+    const labels = renderer.scene.getObjectByName("axis-labels") as THREE.Group;
+    for (const label of labels.children as CSS2DObject[]) {
+      const projected = label.position.clone().project(renderer.camera);
+      const x = (projected.x + 1) * 160;
+      const y = (1 - projected.y) * 180;
+      const fontPixels = parseFloat(label.element.style.fontSize) * 16;
+      expect(x).toBeGreaterThan(12);
+      expect(x).toBeLessThan(308);
+      expect(y - fontPixels * 0.75).toBeGreaterThan(10);
+      expect(y + fontPixels * 0.75).toBeLessThan(350);
+    }
+    const fitted = renderer.camera.position.clone();
+    renderer.camera.position.set(2, 12, -3);
+    renderer.resetCamera();
+    expect(renderer.camera.position.distanceTo(fitted)).toBeLessThan(1e-8);
+    expect(host.dataset.cameraDefault).toBe("true");
+    renderer.resize(1120, 650);
+    expect(renderer.camera.position.toArray()).toEqual([-15, 5.3, 8]);
+    renderer.dispose();
+  });
+
   it("orbits through the lower hemisphere while reset restores the reference view", () => {
     const host = sizedHost();
     const canvas = document.createElement("canvas");

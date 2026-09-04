@@ -187,6 +187,43 @@ export const WAVE_PRESETS: readonly WavePreset[] = Object.freeze([
 
 export const PRESET_DEFINITIONS = WAVE_PRESETS;
 
+const PRESET_OBSERVATIONS: Record<WavePresetId, Record<ProductDomainKind, string>> = {
+  "gaussian-split": {
+    infinite: "",
+    "right-half-line": "The pulse splits. The left-going part reflects from the Neumann boundary without changing sign.",
+    finite: "Watch the pulse split and reflect at the fixed endpoints, reversing sign at each reflection."
+  },
+  "square-wave": {
+    infinite: "The two half-height pulses keep their sharp fronts as they travel apart.",
+    "right-half-line": "Watch the sharp fronts reflect from the Neumann boundary without changing sign.",
+    finite: "The sharp pulses reflect without changing sign at both Neumann endpoints and add when they overlap."
+  },
+  "fixed-end": {
+    infinite: "The initial velocity makes this pulse travel to the left instead of splitting.",
+    "right-half-line": "A left-moving pulse meets a fixed endpoint and returns with inverted displacement.",
+    finite: "Follow the pulse between the fixed endpoints; each reflection reverses its displacement."
+  },
+  "standing-wave": {
+    infinite: "The shape oscillates in place. Look for nodes that remain at zero for every time.",
+    "right-half-line": "A standing wave meets the fixed left endpoint. Its nodes remain at zero throughout the motion.",
+    finite: "Both fixed endpoints and the central node stay at zero while the two lobes oscillate."
+  },
+  "mixed-boundaries": {
+    infinite: "This longer-wavelength standing wave oscillates without shifting its nodes.",
+    "right-half-line": "The left endpoint is a node; compare it with the oscillating crest farther along the half-line.",
+    finite: "Compare the fixed left endpoint with the free right endpoint, where the spatial slope stays zero."
+  },
+  "boundary-driven": {
+    infinite: "This infinite-line analogue is a right-moving pulse: its initial velocity sets the direction.",
+    "right-half-line": "The oscillating left boundary launches a signal into an initially still half-line.",
+    finite: "The driven left endpoint launches a signal that reflects from the fixed right endpoint."
+  }
+};
+
+export function getWavePresetObservation(id: WavePresetId, domain: ProductDomainKind): string {
+  return PRESET_OBSERVATIONS[id][domain];
+}
+
 export function getWavePreset(id: WavePresetId | string): WavePreset | undefined {
   return WAVE_PRESETS.find((preset) => preset.id === id);
 }

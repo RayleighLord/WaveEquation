@@ -21,6 +21,44 @@ const DOMAIN_KINDS: readonly ProductDomainKind[] = [
 ];
 
 describe("wave problem validation", () => {
+  it("reports non-finite compatibility probes as structured errors", () => {
+    const input: WaveProblemInput = {
+      c: 1, T: 1,
+      domain: { kind: "right-half-line", left: 0 },
+      view: { xMin: 0, xMax: 1 },
+      f: [{ id: "f", expression: "1 / (x - 0.00001)", lower: 0, upper: "inf" }],
+      g: [{ id: "g", expression: "0", lower: 0, upper: "inf" }],
+      boundaries: { left: { kind: "neumann", expression: "0" } }
+    };
+    const result = validateWaveProblem(input);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "invalid-expression", path: "f" })
+    ]));
+  });
+
+  it("keeps finite weak corner data explorable", () => {
+    const input = finiteInput();
+    input.f = [{ id: "f", expression: "sqrt(x)", lower: 0, upper: 1 }];
+    input.boundaries = {
+      left: { kind: "neumann", expression: "0" },
+      right: { kind: "dirichlet", expression: "1" }
+    };
+    const result = validateWaveProblem(input);
+    expect(result.ok).toBe(true);
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "neumann-compatibility" })
+    ]));
+  });
+
+  it("does not probe outside a short boundary time interval", () => {
+    const input = finiteInput();
+    input.T = 1e-10;
+    input.f = [{ id: "f", expression: "0", lower: 0, upper: 1 }];
+    input.boundaries.left = { kind: "dirichlet", expression: "sqrt(t * (0.0000000001 - t))" };
+    expect(validateWaveProblem(input).ok).toBe(true);
+  });
+
   it("ships the requested example catalogue and domain-specific final times", () => {
     expect(WAVE_PRESETS.map(({ id, name }) => ({ id, name }))).toEqual([
       { id: "gaussian-split", name: "Gaussian Pulse" },

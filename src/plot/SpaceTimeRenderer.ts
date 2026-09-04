@@ -25,6 +25,7 @@ import { axisValueToLatex, renderLatex } from "./latex";
 import { clamp } from "./svg";
 import { axisTicks, type AxisValueNotation } from "./ticks";
 import { buildSteppedSurfaceBuffers } from "./steppedSurface";
+import type { ProfileSampler } from "./profile";
 
 // World coordinates intentionally follow the reference view: time occupies
 // the long horizontal X axis, space recedes along Z, and displacement is Y.
@@ -97,6 +98,7 @@ export interface PresentationUpdateOptions {
 export interface SolutionUpdateOptions {
   /** The revision-safe worker client already validated the complete grid. */
   validated?: boolean;
+  time?: number;
 }
 
 export interface SpaceTimeRendererOptions {
@@ -164,6 +166,7 @@ export class SpaceTimeRenderer {
   private readonly pointer = new THREE.Vector2();
   private readonly dragPlane = new THREE.Plane();
   private readonly dragPoint = new THREE.Vector3();
+  private readonly defaultCameraPosition = DEFAULT_CAMERA_POSITION.clone();
 
   private readonly floorGrid: THREE.LineSegments<
     THREE.BufferGeometry,
@@ -185,6 +188,8 @@ export class SpaceTimeRenderer {
   private readonly sliceLine: THREE.Line<THREE.BufferGeometry, THREE.LineBasicMaterial>;
 
   private solution: WaveSolutionGrid | null = null;
+  private profileSampler: ProfileSampler | null = null;
+  private webglFrames = 0;
   private physicalBoundaryPositions: number[] = [];
   private characteristics: CharacteristicTrace | null = null;
   private axisNotation: SpaceTimeAxisNotation = { x: "decimal", t: "decimal" };
@@ -199,6 +204,8 @@ export class SpaceTimeRenderer {
   private width: number;
   private height: number;
   private activePointerId: number | null = null;
+  private interactionFrame = 0;
+  private pendingInteraction: { time: number; trigger: TimeInteractionTrigger } | null = null;
   private destroyed = false;
 
   constructor(container: HTMLElement, options: SpaceTimeRendererOptions = {}) {
@@ -472,17 +479,26 @@ export class SpaceTimeRenderer {
       return;
     }
     if (!options.validated) validateSolutionGrid(solution);
+    if (this.interactionFrame) window.cancelAnimationFrame(this.interactionFrame);
+    this.interactionFrame = 0;
+    this.pendingInteraction = null;
+    const wasDefault = this.camera.position.distanceToSquared(this.defaultCameraPosition) < 1e-10;
     this.solution = solution;
     const surfaceRange = normalizedSurfaceRange(solution);
     this.surfaceRangeMinimum = surfaceRange.min;
     this.surfaceRangeMaximum = surfaceRange.max;
-    this.time = clampGridTime(solution, this.time);
+    this.time = clampGridTime(solution, options.time ?? this.time);
     this.positionTimePlane();
     this.rebuildSurface();
     this.rebuildPhysicalBoundaryTraces();
     this.rebuildFloorGrid();
     this.rebuildAxisLabels();
     this.positionFloorAndAxes();
+    if (wasDefault) {
+      this.fitDefaultCamera();
+      this.camera.position.copy(this.defaultCameraPosition);
+      this.camera.lookAt(DEFAULT_CAMERA_TARGET);
+    }
     this.paintTimeSlice();
     this.paintCharacteristics();
     this.container.dataset.geometryReady = "true";
@@ -514,6 +530,18 @@ export class SpaceTimeRenderer {
     this.render();
   }
 
+  setProfileSampler(
+    sampler: ProfileSampler | null,
+    options: PresentationUpdateOptions = {}
+  ): void {
+    if (this.destroyed) return;
+    this.profileSampler = sampler;
+    if (!options.defer && this.solution) {
+      this.paintTimeSlice();
+      this.renderWebGL();
+    }
+  }
+
   setTime(time: number): void {
     if (this.destroyed) {
       return;
@@ -521,6 +549,7 @@ export class SpaceTimeRenderer {
     const nextTime = this.solution
       ? clampGridTime(this.solution, time)
       : Math.max(0, Number.isFinite(time) ? time : 0);
+    this.pendingInteraction = null;
     if (nextTime === this.time) {
       return;
     }
@@ -626,7 +655,8 @@ export class SpaceTimeRenderer {
     if (this.destroyed) {
       return;
     }
-    this.camera.position.copy(DEFAULT_CAMERA_POSITION);
+    this.fitDefaultCamera();
+    this.camera.position.copy(this.defaultCameraPosition);
     if (this.controls) {
       this.controls.target.copy(DEFAULT_CAMERA_TARGET);
       this.controls.update();
@@ -640,6 +670,7 @@ export class SpaceTimeRenderer {
     if (this.destroyed) {
       return;
     }
+    const wasDefault = this.camera.position.distanceToSquared(this.defaultCameraPosition) < 1e-10;
     this.width = Math.max(
       this.options.minimumWidth,
       Number.isFinite(width) ? Number(width) : this.container.clientWidth || this.options.defaultWidth
@@ -652,6 +683,11 @@ export class SpaceTimeRenderer {
     );
     this.camera.aspect = this.width / this.height;
     this.camera.updateProjectionMatrix();
+    if (wasDefault) {
+      this.fitDefaultCamera();
+      this.camera.position.copy(this.defaultCameraPosition);
+      this.camera.lookAt(DEFAULT_CAMERA_TARGET);
+    }
     this.renderer?.setSize(this.width, this.height, false);
     this.labelRenderer?.setSize(this.width, this.height);
     this.container.dataset.renderWidth = String(this.width);
@@ -659,8 +695,56 @@ export class SpaceTimeRenderer {
     this.render();
   }
 
+  /** Preserve the reference viewing direction while reserving room for math. */
+  private fitDefaultCamera(): void {
+    this.defaultCameraPosition.copy(DEFAULT_CAMERA_POSITION);
+    if (this.width >= 760 && this.camera.aspect >= 1.25) return;
+    const probe = this.camera.clone();
+    const direction = DEFAULT_CAMERA_POSITION.clone().sub(DEFAULT_CAMERA_TARGET);
+    const points: { point: THREE.Vector3; width: number; height: number; anchor: THREE.Vector2 }[] = [];
+    for (const t of [WORLD_T_MIN, T_AXIS_LINE_END + AXIS_ARROW_HEIGHT]) {
+      for (const x of [WORLD_X_MIN, X_AXIS_LINE_END + AXIS_ARROW_HEIGHT]) {
+        for (const u of [WORLD_U_MIN - 0.3, U_AXIS_LINE_END + AXIS_ARROW_HEIGHT]) {
+          points.push({ point: new THREE.Vector3(t, u, x), width: 0, height: 0, anchor: new THREE.Vector2() });
+        }
+      }
+    }
+    for (const child of this.axisLabelGroup.children) {
+      if (!(child instanceof CSS2DObject)) continue;
+      const fontPixels = parseFloat(child.element.style.fontSize) * 16;
+      const source = String(child.userData.label ?? "");
+      const visibleLength = source.replace(/\\[a-z]+|[{}]/g, "").length;
+      points.push({
+        point: child.position,
+        width: child.element.offsetWidth || Math.max(fontPixels, Math.min(130, visibleLength * fontPixels * 0.65)),
+        height: child.element.offsetHeight || fontPixels * 1.5,
+        anchor: child.center
+      });
+    }
+    let factor = 1;
+    for (let iteration = 0; iteration < 60; iteration += 1) {
+      probe.position.copy(DEFAULT_CAMERA_TARGET).addScaledVector(direction, factor);
+      probe.lookAt(DEFAULT_CAMERA_TARGET);
+      probe.updateMatrixWorld(true);
+      const fits = points.every(({ point, width, height, anchor }) => {
+        const projected = point.clone().project(probe);
+        const left = (projected.x + 1) * this.width / 2 - width * anchor.x;
+        const top = (1 - projected.y) * this.height / 2 - height * anchor.y;
+        return left >= 12 && left + width <= this.width - 12 && top >= 12 && top + height <= this.height - 12;
+      });
+      if (fits) break;
+      factor *= 1.045;
+    }
+    this.defaultCameraPosition.copy(probe.position);
+    if (this.controls) this.controls.maxDistance = Math.max(28, direction.length() * factor * 1.25);
+  }
+
   clear(): void {
+    if (this.interactionFrame) window.cancelAnimationFrame(this.interactionFrame);
+    this.interactionFrame = 0;
+    this.pendingInteraction = null;
     this.solution = null;
+    this.profileSampler = null;
     this.physicalBoundaryPositions = [];
     this.characteristics = null;
     this.surfaceRangeMinimum = -1;
@@ -695,6 +779,9 @@ export class SpaceTimeRenderer {
       return;
     }
     this.destroyed = true;
+    this.profileSampler = null;
+    if (this.interactionFrame) window.cancelAnimationFrame(this.interactionFrame);
+    this.pendingInteraction = null;
     this.resizeObserver?.disconnect();
     if (this.canvas) {
       this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
@@ -819,15 +906,16 @@ export class SpaceTimeRenderer {
     const nominalStep =
       this.solution.t.length > 1 ? (tMax - tMin) / (this.solution.t.length - 1) : 0;
     const step = nominalStep * (event.shiftKey ? 10 : 1);
-    let next = this.time;
+    const requestedTime = this.pendingInteraction?.time ?? this.time;
+    let next = requestedTime;
     switch (event.key) {
       case "ArrowLeft":
       case "ArrowDown":
-        next = this.time - step;
+        next = requestedTime - step;
         break;
       case "ArrowRight":
       case "ArrowUp":
-        next = this.time + step;
+        next = requestedTime + step;
         break;
       case "Home":
         next = tMin;
@@ -840,8 +928,7 @@ export class SpaceTimeRenderer {
     }
     event.preventDefault();
     this.options.onInteractionStart?.("keyboard");
-    this.setTime(next);
-    this.options.onTimeChange?.(this.time, "keyboard");
+    this.requestTimeChange(next, "keyboard");
   };
 
   private updateRaycaster(event: PointerEvent): void {
@@ -873,8 +960,26 @@ export class SpaceTimeRenderer {
       0,
       1
     );
-    this.setTime(tMin + fraction * (tMax - tMin));
-    this.options.onTimeChange?.(this.time, "plane-drag");
+    this.requestTimeChange(tMin + fraction * (tMax - tMin), "plane-drag");
+  }
+
+  private requestTimeChange(time: number, trigger: TimeInteractionTrigger): void {
+    const next = this.solution ? clampGridTime(this.solution, time) : time;
+    this.pendingInteraction = { time: next, trigger };
+    // The application owns selected time and coalesces every dependent view in
+    // its animation frame. Standalone renderers retain the same behavior using
+    // one local frame, including a final pointermove immediately before release.
+    if (this.options.onTimeChange) {
+      this.options.onTimeChange(next, trigger);
+      return;
+    }
+    if (this.interactionFrame) return;
+    this.interactionFrame = window.requestAnimationFrame(() => {
+      this.interactionFrame = 0;
+      const pending = this.pendingInteraction;
+      this.pendingInteraction = null;
+      if (pending && !this.destroyed) this.setTime(pending.time);
+    });
   }
 
   private rebuildSurface(): void {
@@ -1180,25 +1285,27 @@ export class SpaceTimeRenderer {
     if (!this.solution) {
       return;
     }
-    const values = sampleSlice(this.solution, this.time);
-    const expectedLength = this.solution.x.length * 3;
+    const profile = this.profileSampler?.grid === this.solution
+      ? this.profileSampler.sample(this.time)
+      : { x: this.solution.x, values: sampleSlice(this.solution, this.time) };
+    const expectedLength = profile.x.length * 3;
     const currentAttribute = this.sliceLine.geometry.getAttribute("position");
     let positions: Float32Array;
     if (
       currentAttribute instanceof THREE.BufferAttribute &&
       currentAttribute.array instanceof Float32Array &&
-      currentAttribute.array.length === expectedLength
+      currentAttribute.array.length >= expectedLength
     ) {
       positions = currentAttribute.array;
     } else {
       positions = new Float32Array(expectedLength);
     }
     const worldT = this.worldT(this.time);
-    for (let index = 0; index < this.solution.x.length; index += 1) {
+    for (let index = 0; index < profile.x.length; index += 1) {
       const offset = index * 3;
       positions[offset] = worldT;
-      positions[offset + 1] = this.worldU(Number(values[index]));
-      positions[offset + 2] = this.worldX(Number(this.solution.x[index]));
+      positions[offset + 1] = this.worldU(Number(profile.values[index]));
+      positions[offset + 2] = this.worldX(Number(profile.x[index]));
     }
     if (positions === currentAttribute?.array) {
       currentAttribute.needsUpdate = true;
@@ -1210,6 +1317,7 @@ export class SpaceTimeRenderer {
       geometry.computeBoundingSphere();
       this.sliceLine.geometry = geometry;
     }
+    this.sliceLine.geometry.setDrawRange(0, profile.x.length);
   }
 
   private positionTimePlane(): void {
@@ -1242,7 +1350,7 @@ export class SpaceTimeRenderer {
       XI_CHARACTERISTIC_COLOR
     );
 
-    const floorY = this.worldU(0) + 0.035;
+    const floorY = this.worldU(0);
     for (const hit of this.characteristics.hits) {
       const color = this.characteristicColor(hit.path);
       const marker = new THREE.Mesh(
@@ -1316,7 +1424,7 @@ export class SpaceTimeRenderer {
     selected.name = "characteristic-selected-point";
     selected.position.set(
       this.worldT(this.characteristics.point.t),
-      this.worldU(this.characteristics.point.u),
+      floorY,
       this.worldX(this.characteristics.point.x)
     );
     selected.renderOrder = 10;
@@ -1440,7 +1548,7 @@ export class SpaceTimeRenderer {
     if (points.length < 2) {
       return;
     }
-    const floorY = this.worldU(0) + 0.03;
+    const floorY = this.worldU(0);
     const floorPoints = points.map(
       (point) => new THREE.Vector3(this.worldT(point.t), floorY, this.worldX(point.x))
     );
@@ -1796,7 +1904,7 @@ export class SpaceTimeRenderer {
 
   private updateCameraDatasets(): void {
     const target = this.controls?.target ?? DEFAULT_CAMERA_TARGET;
-    const isDefault = this.camera.position.distanceToSquared(DEFAULT_CAMERA_POSITION) < 1e-12 &&
+    const isDefault = this.camera.position.distanceToSquared(this.defaultCameraPosition) < 1e-12 &&
       target.distanceToSquared(DEFAULT_CAMERA_TARGET) < 1e-12;
     const hemisphere = this.camera.position.y < target.y ? "below" : "above";
     for (const element of [this.container, this.canvas]) {
@@ -1836,10 +1944,15 @@ export class SpaceTimeRenderer {
       return;
     }
     this.updateCameraDatasets();
+    this.camera.updateMatrixWorld(true);
+    const grab = new THREE.Vector3(this.timePlane.position.x, 0, 0).project(this.camera);
+    this.container.dataset.timePlaneGrabX = String((grab.x + 1) * this.width / 2);
+    this.container.dataset.timePlaneGrabY = String((1 - grab.y) * this.height / 2);
     if (!this.renderer) {
       return;
     }
     this.renderer.render(this.scene, this.camera);
+    this.container.dataset.webglFrames = String(++this.webglFrames);
   }
 
   private renderLabels(): void {

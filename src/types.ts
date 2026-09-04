@@ -85,6 +85,7 @@ export type ProblemNoticeCode =
   | "dirichlet-corner"
   | "dirichlet-compatibility"
   | "neumann-compatibility"
+  | "sampling-resolution"
   | "reflection-limit";
 
 export interface ProblemNotice {
